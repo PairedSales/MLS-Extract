@@ -80,6 +80,9 @@ function handleImageFile(file) {
   countBadge.classList.add('hidden');
   resultCard.classList.add('hidden');
   clearStatus();
+
+  // Auto-trigger extraction immediately
+  runExtraction();
 }
 
 function resetState() {
@@ -97,7 +100,10 @@ function resetState() {
 
 /* ===== OCR Extraction ===== */
 
-extractBtn.addEventListener('click', async () => {
+// Manual retry via button
+extractBtn.addEventListener('click', () => runExtraction());
+
+async function runExtraction() {
   if (!currentImageBlob) return;
 
   extractBtn.disabled = true;
@@ -158,7 +164,7 @@ extractBtn.addEventListener('click', async () => {
   } finally {
     extractBtn.disabled = false;
   }
-});
+}
 
 /* ===== Clipboard ===== */
 
