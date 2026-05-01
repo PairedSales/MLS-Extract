@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MLS Extract — OCR MLS Number Extractor</title>
+  <meta name="description" content="Extract MLS numbers from screenshots using client-side OCR. Paste or upload an image and get formatted MLS numbers copied to your clipboard instantly." />
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+  <!-- Tesseract.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+
+  <!-- Styles -->
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <div class="app-container">
+
+    <!-- Header -->
+    <header class="app-header">
+      <div class="app-header__icon">🔍</div>
+      <h1>MLS Extract</h1>
+      <p class="app-header__subtitle">Paste or upload an image → extract MLS numbers instantly</p>
+    </header>
+
+    <!-- Input Card -->
+    <section class="card" id="input-card">
+      <div class="card__title"><span>📷</span> Image Input</div>
+
+      <div class="drop-zone" id="drop-zone">
+        <input type="file" id="file-input" accept="image/png, image/jpeg, image/webp" />
+        <span class="drop-zone__icon">📋</span>
+        <div class="drop-zone__text">
+          <strong>Ctrl + V</strong> to paste, or click to upload<br />
+          <small>Supports PNG, JPG, WebP</small>
+        </div>
+      </div>
+
+      <!-- Image Preview -->
+      <div class="preview-wrapper hidden" id="preview-wrapper">
+        <img id="preview-img" alt="Uploaded MLS screenshot preview" />
+        <button class="preview-clear" id="clear-btn" title="Clear image" aria-label="Clear image">✕</button>
+      </div>
+
+      <!-- Extract Button -->
+      <div class="action-row">
+        <button class="btn btn--primary" id="extract-btn" disabled>
+          <span>⚡</span> Extract MLS Numbers
+        </button>
+      </div>
+
+      <!-- Progress -->
+      <div class="progress-container hidden" id="progress-container">
+        <div class="progress-label">
+          <span>Processing…</span>
+          <span id="progress-pct">0%</span>
+        </div>
+        <div class="progress-bar">
+          <div class="progress-bar__fill" id="progress-fill" style="width: 0%"></div>
+        </div>
+      </div>
+
+      <!-- Status Messages -->
+      <div class="status hidden" id="status-area"></div>
+    </section>
+
+    <!-- Result Card -->
+    <section class="card hidden" id="result-card">
+      <div class="card__title"><span>📄</span> Extracted Numbers</div>
+
+      <div class="count-badge hidden" id="count-badge">
+        <span>🔢</span> <span id="count-number">0</span> MLS numbers found
+      </div>
+
+      <textarea class="output-box" id="output-box" readonly placeholder="Extracted MLS numbers will appear here…" rows="3"></textarea>
+
+      <div class="action-row">
+        <button class="btn btn--copy" id="copy-btn" disabled>
+          <span>📋</span> Copy to Clipboard
+        </button>
+      </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="app-footer">
+      Powered by <a href="https://github.com/naptha/tesseract.js" target="_blank" rel="noopener">Tesseract.js</a> — 100% client-side, no data leaves your browser.
+    </footer>
+
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>
