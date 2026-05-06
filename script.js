@@ -21,6 +21,15 @@ const resultCard    = $('#result-card');
 
 let currentImageBlob = null;
 
+const OCR_ROW_CONFIDENCE_MIN = 45;
+const ROW_TEXT_DARK_THRESHOLD = 208;
+const ROW_MIN_DARK_PIXELS = 3;
+const ROW_MIN_HEIGHT = 10;
+const ROW_PADDING_Y = 3;
+const ROW_MAX_SCAN_RATIO = 0.9;
+const COLUMN_SEARCH_START = 0.45;
+const COLUMN_SEARCH_END = 0.95;
+
 /* ===== Image Input ===== */
 
 document.addEventListener('paste', (e) => {
@@ -94,7 +103,7 @@ function resetState() {
   clearStatus();
 }
 
-/* ===== Image Preprocessing ===== */
+/* ===== Preprocessing / Segmentation ===== */
 
 function loadImageFromBlob(blob) {
   return new Promise((resolve, reject) => {
@@ -105,118 +114,169 @@ function loadImageFromBlob(blob) {
   });
 }
 
-function applyUnsharpMask(imageData, amount = 1.1) {
+function canvasFromImage(img) {
+  const canvas = document.createElement('canvas');
+  canvas.width = img.width;
+  canvas.height = img.height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0);
+  return canvas;
+}
+
+function cropCanvas(sourceCanvas, x, y, w, h) {
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.floor(w));
+  canvas.height = Math.max(1, Math.floor(h));
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(sourceCanvas, Math.floor(x), Math.floor(y), Math.floor(w), Math.floor(h), 0, 0, canvas.width, canvas.height);
+  return canvas;
+}
+
+function scaleCanvas(sourceCanvas, scaleFactor) {
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.floor(sourceCanvas.width * scaleFactor));
+  canvas.height = Math.max(1, Math.floor(sourceCanvas.height * scaleFactor));
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(sourceCanvas, 0, 0, canvas.width, canvas.height);
+  return canvas;
+}
+
+function grayscaleCanvas(sourceCanvas) {
+  const canvas = cropCanvas(sourceCanvas, 0, 0, sourceCanvas.width, sourceCanvas.height);
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const { data } = imageData;
+  for (let i = 0; i < data.length; i += 4) {
+    const lum = Math.round(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
+    data[i] = data[i + 1] = data[i + 2] = lum;
+  }
+  ctx.putImageData(imageData, 0, 0);
+  return canvas;
+}
+
+function sharpenCanvas(sourceCanvas, amount = 0.9) {
+  const canvas = grayscaleCanvas(sourceCanvas);
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const { width, height, data } = imageData;
   const gray = new Uint8ClampedArray(width * height);
-  for (let i = 0; i < data.length; i += 4) {
-    gray[i / 4] = data[i];
-  }
 
-  const blurred = new Uint8ClampedArray(width * height);
+  for (let i = 0; i < data.length; i += 4) gray[i / 4] = data[i];
+
   for (let y = 1; y < height - 1; y++) {
     for (let x = 1; x < width - 1; x++) {
       const idx = y * width + x;
-      const sum =
+      const blur = (
         gray[idx] * 4 +
         gray[idx - 1] + gray[idx + 1] +
-        gray[idx - width] + gray[idx + width];
-      blurred[idx] = sum / 8;
+        gray[idx - width] + gray[idx + width]
+      ) / 8;
+      const value = Math.max(0, Math.min(255, gray[idx] + amount * (gray[idx] - blur)));
+      const p = idx * 4;
+      data[p] = data[p + 1] = data[p + 2] = value;
     }
   }
 
-  for (let i = 0; i < gray.length; i++) {
-    const val = Math.max(0, Math.min(255, gray[i] + amount * (gray[i] - blurred[i])));
-    const p = i * 4;
-    data[p] = data[p + 1] = data[p + 2] = val;
-    data[p + 3] = 255;
-  }
-
-  return imageData;
+  ctx.putImageData(imageData, 0, 0);
+  return canvas;
 }
 
-function otsuThreshold(histogram, totalPixels) {
-  let sum = 0;
-  for (let i = 0; i < 256; i++) sum += i * histogram[i];
-
-  let sumB = 0;
-  let wB = 0;
-  let maxVariance = 0;
-  let threshold = 128;
-
-  for (let t = 0; t < 256; t++) {
-    wB += histogram[t];
-    if (wB === 0) continue;
-
-    const wF = totalPixels - wB;
-    if (wF === 0) break;
-
-    sumB += t * histogram[t];
-    const mB = sumB / wB;
-    const mF = (sum - sumB) / wF;
-    const variance = wB * wF * (mB - mF) ** 2;
-
-    if (variance > maxVariance) {
-      maxVariance = variance;
-      threshold = t;
-    }
-  }
-
-  return threshold;
-}
-
-function preprocessCanvasForOCR(sourceCanvas, scaleFactor) {
-  const scaledCanvas = document.createElement('canvas');
-  scaledCanvas.width = sourceCanvas.width * scaleFactor;
-  scaledCanvas.height = sourceCanvas.height * scaleFactor;
-  const sctx = scaledCanvas.getContext('2d', { willReadFrequently: true });
-  sctx.imageSmoothingEnabled = false;
-  sctx.drawImage(sourceCanvas, 0, 0, scaledCanvas.width, scaledCanvas.height);
-
-  const imageData = sctx.getImageData(0, 0, scaledCanvas.width, scaledCanvas.height);
+function detectMlsColumnBounds(baseCanvas) {
+  const ctx = baseCanvas.getContext('2d', { willReadFrequently: true });
+  const { width, height } = baseCanvas;
+  const imageData = ctx.getImageData(0, 0, width, height);
   const { data } = imageData;
+  const colDark = new Float32Array(width);
 
-  const histogram = new Uint32Array(256);
-  for (let i = 0; i < data.length; i += 4) {
-    const lum = Math.round(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
-    const contrasted = Math.max(0, Math.min(255, (lum - 128) * 1.5 + 128));
-    data[i] = data[i + 1] = data[i + 2] = contrasted;
-    histogram[contrasted]++;
+  for (let x = 0; x < width; x++) {
+    let score = 0;
+    for (let y = 0; y < height; y++) {
+      const p = (y * width + x) * 4;
+      const lum = 0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2];
+      if (lum < 210) score += (210 - lum);
+    }
+    colDark[x] = score;
   }
 
-  applyUnsharpMask(imageData, 1.15);
+  const start = Math.floor(width * COLUMN_SEARCH_START);
+  const end = Math.floor(width * COLUMN_SEARCH_END);
+  let bestX = start;
+  let bestScore = -1;
+  const window = Math.max(30, Math.floor(width * 0.07));
 
-  const threshold = otsuThreshold(histogram, data.length / 4);
-  for (let i = 0; i < data.length; i += 4) {
-    const pixel = data[i] < threshold ? 0 : 255;
-    data[i] = data[i + 1] = data[i + 2] = pixel;
-    data[i + 3] = 255;
+  for (let x = start; x < end - window; x++) {
+    let wScore = 0;
+    for (let i = 0; i < window; i++) wScore += colDark[x + i];
+    if (wScore > bestScore) {
+      bestScore = wScore;
+      bestX = x;
+    }
   }
 
-  sctx.putImageData(imageData, 0, 0);
-  return scaledCanvas;
+  const left = Math.max(0, bestX - Math.floor(window * 0.28));
+  const right = Math.min(width, bestX + Math.floor(window * 1.35));
+  return { x: left, w: Math.max(1, right - left), y: 0, h: height };
 }
 
-async function preprocessImageVariants(blob) {
-  const img = await loadImageFromBlob(blob);
+function detectRowBands(columnCanvas) {
+  const gray = grayscaleCanvas(columnCanvas);
+  const ctx = gray.getContext('2d', { willReadFrequently: true });
+  const { width, height } = gray;
+  const { data } = ctx.getImageData(0, 0, width, height);
 
-  const baseCanvas = document.createElement('canvas');
-  baseCanvas.width = img.width;
-  baseCanvas.height = img.height;
-  const bctx = baseCanvas.getContext('2d');
-  bctx.drawImage(img, 0, 0);
+  const rowActivity = new Uint16Array(height);
+  for (let y = 0; y < height; y++) {
+    let darkPixels = 0;
+    for (let x = 0; x < width; x++) {
+      const p = (y * width + x) * 4;
+      if (data[p] < ROW_TEXT_DARK_THRESHOLD) darkPixels++;
+    }
+    rowActivity[y] = darkPixels;
+  }
 
-  const fullImage = preprocessCanvasForOCR(baseCanvas, 3);
+  const maxScanY = Math.floor(height * ROW_MAX_SCAN_RATIO);
+  const rows = [];
+  let inBand = false;
+  let start = 0;
 
-  const columnCrop = document.createElement('canvas');
-  const cropX = Math.floor(baseCanvas.width * 0.55);
-  const cropW = Math.max(1, Math.floor(baseCanvas.width * 0.45));
-  columnCrop.width = cropW;
-  columnCrop.height = baseCanvas.height;
-  const cctx = columnCrop.getContext('2d');
-  cctx.drawImage(baseCanvas, cropX, 0, cropW, baseCanvas.height, 0, 0, cropW, baseCanvas.height);
+  for (let y = 0; y < maxScanY; y++) {
+    const active = rowActivity[y] >= ROW_MIN_DARK_PIXELS;
+    if (active && !inBand) {
+      inBand = true;
+      start = y;
+    } else if (!active && inBand) {
+      inBand = false;
+      const end = y;
+      if (end - start >= ROW_MIN_HEIGHT) {
+        rows.push({ y0: Math.max(0, start - ROW_PADDING_Y), y1: Math.min(height, end + ROW_PADDING_Y) });
+      }
+    }
+  }
 
-  const columnImage = preprocessCanvasForOCR(columnCrop, 4);
-  return [fullImage, columnImage];
+  if (inBand) {
+    const end = maxScanY;
+    if (end - start >= ROW_MIN_HEIGHT) {
+      rows.push({ y0: Math.max(0, start - ROW_PADDING_Y), y1: Math.min(height, end + ROW_PADDING_Y) });
+    }
+  }
+
+  return rows;
+}
+
+function buildOcrVariants(rowCanvas) {
+  return [
+    { name: 'raw', canvas: rowCanvas },
+    { name: 'grayscale', canvas: grayscaleCanvas(rowCanvas) },
+    { name: 'enlarged', canvas: scaleCanvas(rowCanvas, 2.2) },
+    { name: 'sharpened', canvas: sharpenCanvas(scaleCanvas(rowCanvas, 2.0), 0.95) },
+  ];
+}
+
+function normalizeMlsDigits(text) {
+  const digits = (text || '').replace(/\D+/g, '');
+  if (digits.length < 7 || digits.length > 8) return null;
+  return digits;
 }
 
 /* ===== OCR Extraction ===== */
@@ -238,8 +298,18 @@ async function runExtraction() {
   let worker;
 
   try {
-    showStatus('Preprocessing image…', 'info');
-    const variants = await preprocessImageVariants(currentImageBlob);
+    showStatus('Preparing image and row segments…', 'info');
+    const img = await loadImageFromBlob(currentImageBlob);
+    const baseCanvas = canvasFromImage(img);
+    const column = detectMlsColumnBounds(baseCanvas);
+    const columnCanvas = cropCanvas(baseCanvas, column.x, column.y, column.w, column.h);
+    const rowBands = detectRowBands(columnCanvas);
+
+    if (!rowBands.length) {
+      showStatus('No MLS rows detected in the screenshot.', 'error');
+      progressWrap.classList.add('hidden');
+      return;
+    }
 
     showStatus('Initializing OCR engine…', 'info');
     worker = await Tesseract.createWorker('eng', 1, {
@@ -252,48 +322,57 @@ async function runExtraction() {
 
     await worker.setParameters({
       tessedit_char_whitelist: '0123456789',
+      tessedit_pageseg_mode: Tesseract.PSM.SINGLE_LINE,
       preserve_interword_spaces: '0',
-      tessedit_pageseg_mode: '6',
       classify_bln_numeric_mode: '1',
       load_system_dawg: '0',
       load_freq_dawg: '0',
     });
 
-    showStatus('Extracting text from image…', 'info');
+    showStatus('OCR on each MLS row…', 'info');
 
-    const textChunks = [];
-    for (const variant of variants) {
-      const { data: { text } } = await worker.recognize(variant);
-      textChunks.push(text);
-    }
-
-    updateProgress(100);
-
-    const combinedText = textChunks.join('\n');
-    const matches = combinedText.match(/\b\d{7,8}\b/g) || [];
-    const deduped = [];
+    const accepted = [];
     const seen = new Set();
-    for (const mls of matches) {
-      if (!seen.has(mls)) {
-        seen.add(mls);
-        deduped.push(mls);
+
+    for (let i = 0; i < rowBands.length; i++) {
+      const band = rowBands[i];
+      const rowCanvas = cropCanvas(columnCanvas, 0, band.y0, columnCanvas.width, band.y1 - band.y0);
+      const variants = buildOcrVariants(rowCanvas);
+
+      let best = { digits: null, confidence: -Infinity };
+
+      for (const variant of variants) {
+        const { data: result } = await worker.recognize(variant.canvas);
+        const digits = normalizeMlsDigits(result.text);
+        const confidence = Number.isFinite(result.confidence) ? result.confidence : -1;
+        if (digits && confidence > best.confidence) {
+          best = { digits, confidence };
+        }
       }
+
+      if (best.digits && best.confidence >= OCR_ROW_CONFIDENCE_MIN && !seen.has(best.digits)) {
+        seen.add(best.digits);
+        accepted.push(best.digits);
+      }
+
+      const pct = Math.round(((i + 1) / rowBands.length) * 100);
+      updateProgress(Math.max(1, pct));
     }
 
-    if (deduped.length === 0) {
-      showStatus('No valid MLS numbers detected.', 'error');
+    if (accepted.length === 0) {
+      showStatus('No valid MLS numbers passed confidence and format checks.', 'error');
       progressWrap.classList.add('hidden');
       return;
     }
 
-    const formatted = deduped.join(', ');
+    const formatted = accepted.join(', ');
     outputBox.value = formatted;
     resultCard.classList.remove('hidden');
-    countNumber.textContent = deduped.length;
+    countNumber.textContent = accepted.length;
     countBadge.classList.remove('hidden');
     copyBtn.disabled = false;
-
     progressWrap.classList.add('hidden');
+    showStatus('Extraction complete.', 'success');
   } catch (err) {
     console.error('OCR Error:', err);
     showStatus('Text extraction failed. Try a clearer image.', 'error');
