@@ -23,7 +23,6 @@ let currentImageBlob = null;
 
 /* ===== Image Input ===== */
 
-// Paste from clipboard (Ctrl+V anywhere)
 document.addEventListener('paste', (e) => {
   const items = e.clipboardData?.items;
   if (!items) return;
@@ -37,14 +36,12 @@ document.addEventListener('paste', (e) => {
   }
 });
 
-// File input change
 fileInput.addEventListener('change', () => {
   if (fileInput.files.length > 0) {
     handleImageFile(fileInput.files[0]);
   }
 });
 
-// Drag & drop visual states
 dropZone.addEventListener('dragover', (e) => {
   e.preventDefault();
   dropZone.classList.add('drag-over');
@@ -60,7 +57,6 @@ dropZone.addEventListener('drop', (e) => {
   }
 });
 
-// Clear preview
 clearBtn.addEventListener('click', () => {
   resetState();
 });
@@ -70,18 +66,18 @@ function handleImageFile(file) {
     showStatus('Please provide a valid image file (PNG, JPG).', 'error');
     return;
   }
+
   currentImageBlob = file;
   const url = URL.createObjectURL(file);
   previewImg.src = url;
   previewWrap.classList.remove('hidden');
   extractBtn.disabled = false;
-  // Reset results when new image loaded
+
   outputBox.value = '';
   countBadge.classList.add('hidden');
   resultCard.classList.add('hidden');
   clearStatus();
 
-  // Auto-trigger extraction immediately
   runExtraction();
 }
 
@@ -100,82 +96,131 @@ function resetState() {
 
 /* ===== Image Preprocessing ===== */
 
-/**
- * Pre-processes the image for OCR:
- *  - Scales up 3× for better feature extraction
- *  - Converts to grayscale
- *  - Applies binary threshold (Otsu-style) for crisp black-on-white text
- * Returns a Blob of the processed PNG.
- */
-function preprocessImage(blob) {
+function loadImageFromBlob(blob) {
   return new Promise((resolve, reject) => {
     const img = new Image();
-    img.onload = () => {
-      const SCALE = 3;
-      const canvas = document.createElement('canvas');
-      canvas.width  = img.width  * SCALE;
-      canvas.height = img.height * SCALE;
-      const ctx = canvas.getContext('2d');
-
-      // Disable smoothing for sharp upscale
-      ctx.imageSmoothingEnabled = false;
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-
-      // Grab pixel data
-      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const data = imageData.data;
-
-      // Convert to grayscale and collect luminance histogram for Otsu threshold
-      const grayscale = new Uint8Array(data.length / 4);
-      const histogram = new Uint32Array(256);
-      for (let i = 0; i < data.length; i += 4) {
-        const lum = Math.round(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
-        grayscale[i / 4] = lum;
-        histogram[lum]++;
-      }
-
-      // Otsu's method to find optimal threshold
-      const totalPixels = grayscale.length;
-      let sumTotal = 0;
-      for (let t = 0; t < 256; t++) sumTotal += t * histogram[t];
-
-      let sumBg = 0, weightBg = 0, maxVariance = 0, bestThreshold = 128;
-      for (let t = 0; t < 256; t++) {
-        weightBg += histogram[t];
-        if (weightBg === 0) continue;
-        const weightFg = totalPixels - weightBg;
-        if (weightFg === 0) break;
-
-        sumBg += t * histogram[t];
-        const meanBg = sumBg / weightBg;
-        const meanFg = (sumTotal - sumBg) / weightFg;
-        const variance = weightBg * weightFg * (meanBg - meanFg) ** 2;
-
-        if (variance > maxVariance) {
-          maxVariance = variance;
-          bestThreshold = t;
-        }
-      }
-
-      // Apply threshold — dark text on white background
-      for (let i = 0; i < grayscale.length; i++) {
-        const val = grayscale[i] < bestThreshold ? 0 : 255;
-        const idx = i * 4;
-        data[idx] = data[idx + 1] = data[idx + 2] = val;
-        data[idx + 3] = 255;
-      }
-
-      ctx.putImageData(imageData, 0, 0);
-      canvas.toBlob((processedBlob) => resolve(processedBlob), 'image/png');
-    };
+    img.onload = () => resolve(img);
     img.onerror = reject;
     img.src = URL.createObjectURL(blob);
   });
 }
 
+function applyUnsharpMask(imageData, amount = 1.1) {
+  const { width, height, data } = imageData;
+  const gray = new Uint8ClampedArray(width * height);
+  for (let i = 0; i < data.length; i += 4) {
+    gray[i / 4] = data[i];
+  }
+
+  const blurred = new Uint8ClampedArray(width * height);
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const idx = y * width + x;
+      const sum =
+        gray[idx] * 4 +
+        gray[idx - 1] + gray[idx + 1] +
+        gray[idx - width] + gray[idx + width];
+      blurred[idx] = sum / 8;
+    }
+  }
+
+  for (let i = 0; i < gray.length; i++) {
+    const val = Math.max(0, Math.min(255, gray[i] + amount * (gray[i] - blurred[i])));
+    const p = i * 4;
+    data[p] = data[p + 1] = data[p + 2] = val;
+    data[p + 3] = 255;
+  }
+
+  return imageData;
+}
+
+function otsuThreshold(histogram, totalPixels) {
+  let sum = 0;
+  for (let i = 0; i < 256; i++) sum += i * histogram[i];
+
+  let sumB = 0;
+  let wB = 0;
+  let maxVariance = 0;
+  let threshold = 128;
+
+  for (let t = 0; t < 256; t++) {
+    wB += histogram[t];
+    if (wB === 0) continue;
+
+    const wF = totalPixels - wB;
+    if (wF === 0) break;
+
+    sumB += t * histogram[t];
+    const mB = sumB / wB;
+    const mF = (sum - sumB) / wF;
+    const variance = wB * wF * (mB - mF) ** 2;
+
+    if (variance > maxVariance) {
+      maxVariance = variance;
+      threshold = t;
+    }
+  }
+
+  return threshold;
+}
+
+function preprocessCanvasForOCR(sourceCanvas, scaleFactor) {
+  const scaledCanvas = document.createElement('canvas');
+  scaledCanvas.width = sourceCanvas.width * scaleFactor;
+  scaledCanvas.height = sourceCanvas.height * scaleFactor;
+  const sctx = scaledCanvas.getContext('2d', { willReadFrequently: true });
+  sctx.imageSmoothingEnabled = false;
+  sctx.drawImage(sourceCanvas, 0, 0, scaledCanvas.width, scaledCanvas.height);
+
+  const imageData = sctx.getImageData(0, 0, scaledCanvas.width, scaledCanvas.height);
+  const { data } = imageData;
+
+  const histogram = new Uint32Array(256);
+  for (let i = 0; i < data.length; i += 4) {
+    const lum = Math.round(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
+    const contrasted = Math.max(0, Math.min(255, (lum - 128) * 1.5 + 128));
+    data[i] = data[i + 1] = data[i + 2] = contrasted;
+    histogram[contrasted]++;
+  }
+
+  applyUnsharpMask(imageData, 1.15);
+
+  const threshold = otsuThreshold(histogram, data.length / 4);
+  for (let i = 0; i < data.length; i += 4) {
+    const pixel = data[i] < threshold ? 0 : 255;
+    data[i] = data[i + 1] = data[i + 2] = pixel;
+    data[i + 3] = 255;
+  }
+
+  sctx.putImageData(imageData, 0, 0);
+  return scaledCanvas;
+}
+
+async function preprocessImageVariants(blob) {
+  const img = await loadImageFromBlob(blob);
+
+  const baseCanvas = document.createElement('canvas');
+  baseCanvas.width = img.width;
+  baseCanvas.height = img.height;
+  const bctx = baseCanvas.getContext('2d');
+  bctx.drawImage(img, 0, 0);
+
+  const fullImage = preprocessCanvasForOCR(baseCanvas, 3);
+
+  const columnCrop = document.createElement('canvas');
+  const cropX = Math.floor(baseCanvas.width * 0.55);
+  const cropW = Math.max(1, Math.floor(baseCanvas.width * 0.45));
+  columnCrop.width = cropW;
+  columnCrop.height = baseCanvas.height;
+  const cctx = columnCrop.getContext('2d');
+  cctx.drawImage(baseCanvas, cropX, 0, cropW, baseCanvas.height, 0, 0, cropW, baseCanvas.height);
+
+  const columnImage = preprocessCanvasForOCR(columnCrop, 4);
+  return [fullImage, columnImage];
+}
+
 /* ===== OCR Extraction ===== */
 
-// Manual retry via button
 extractBtn.addEventListener('click', () => runExtraction());
 
 async function runExtraction() {
@@ -187,18 +232,17 @@ async function runExtraction() {
   countBadge.classList.add('hidden');
   outputBox.value = '';
   clearStatus();
-
-  // Show progress
   progressWrap.classList.remove('hidden');
   updateProgress(0);
 
+  let worker;
+
   try {
     showStatus('Preprocessing image…', 'info');
-    const processedBlob = await preprocessImage(currentImageBlob);
+    const variants = await preprocessImageVariants(currentImageBlob);
 
     showStatus('Initializing OCR engine…', 'info');
-
-    const worker = await Tesseract.createWorker('eng', 1, {
+    worker = await Tesseract.createWorker('eng', 1, {
       logger: (msg) => {
         if (msg.status === 'recognizing text') {
           updateProgress(Math.round(msg.progress * 100));
@@ -206,48 +250,58 @@ async function runExtraction() {
       },
     });
 
-    // Configure for digit-only recognition
     await worker.setParameters({
       tessedit_char_whitelist: '0123456789',
-      tessedit_pageseg_mode: '6',   // Uniform block of text
-      load_system_dawg: '0',         // Disable dictionary
-      load_freq_dawg: '0',           // Disable frequency dictionary
+      preserve_interword_spaces: '0',
+      tessedit_pageseg_mode: '6',
+      classify_bln_numeric_mode: '1',
+      load_system_dawg: '0',
+      load_freq_dawg: '0',
     });
 
     showStatus('Extracting text from image…', 'info');
 
-    const { data: { text } } = await worker.recognize(processedBlob);
-    await worker.terminate();
+    const textChunks = [];
+    for (const variant of variants) {
+      const { data: { text } } = await worker.recognize(variant);
+      textChunks.push(text);
+    }
 
     updateProgress(100);
 
-    // Extract 8-digit MLS numbers
-    const matches = text.match(/\b\d{8}\b/g) || [];
+    const combinedText = textChunks.join('\n');
+    const matches = combinedText.match(/\b\d{7,8}\b/g) || [];
+    const deduped = [];
+    const seen = new Set();
+    for (const mls of matches) {
+      if (!seen.has(mls)) {
+        seen.add(mls);
+        deduped.push(mls);
+      }
+    }
 
-    if (matches.length === 0) {
+    if (deduped.length === 0) {
       showStatus('No valid MLS numbers detected.', 'error');
       progressWrap.classList.add('hidden');
-      extractBtn.disabled = false;
       return;
     }
 
-    const formatted = matches.join(', ');
+    const formatted = deduped.join(', ');
     outputBox.value = formatted;
-
-    // Show result card & count
     resultCard.classList.remove('hidden');
-    countNumber.textContent = matches.length;
+    countNumber.textContent = deduped.length;
     countBadge.classList.remove('hidden');
     copyBtn.disabled = false;
 
-    // Auto-copy
     progressWrap.classList.add('hidden');
-    await copyToClipboard(formatted);
   } catch (err) {
     console.error('OCR Error:', err);
     showStatus('Text extraction failed. Try a clearer image.', 'error');
     progressWrap.classList.add('hidden');
   } finally {
+    if (worker) {
+      await worker.terminate();
+    }
     extractBtn.disabled = false;
   }
 }
@@ -271,8 +325,8 @@ async function copyToClipboard(text) {
       copyBtn.innerHTML = '<span>📋</span> Copy to Clipboard';
     }, 2500);
   } catch (err) {
-    console.warn('Auto-copy failed:', err);
-    showStatus('Auto-copy blocked — use the Copy button.', 'error');
+    console.warn('Copy failed:', err);
+    showStatus('Copy failed — use manual select/copy.', 'error');
   }
 }
 
