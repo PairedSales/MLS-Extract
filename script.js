@@ -21,14 +21,15 @@ const resultCard    = $('#result-card');
 
 let currentImageBlob = null;
 
-const OCR_ROW_CONFIDENCE_MIN = 45;
-const ROW_TEXT_DARK_THRESHOLD = 208;
+const OCR_ROW_CONFIDENCE_MIN = 35;
+const ROW_TEXT_DARK_THRESHOLD = 170;
 const ROW_MIN_DARK_PIXELS = 3;
 const ROW_MIN_HEIGHT = 10;
 const ROW_PADDING_Y = 3;
 const ROW_MAX_SCAN_RATIO = 0.9;
 const COLUMN_SEARCH_START = 0.45;
 const COLUMN_SEARCH_END = 0.95;
+const LIGHT_BG_CUTOFF = 240;
 
 /* ===== Image Input ===== */
 
@@ -182,6 +183,34 @@ function sharpenCanvas(sourceCanvas, amount = 0.9) {
   return canvas;
 }
 
+function thresholdForBlackText(sourceCanvas) {
+  const gray = grayscaleCanvas(sourceCanvas);
+  const ctx = gray.getContext('2d', { willReadFrequently: true });
+  const imageData = ctx.getImageData(0, 0, gray.width, gray.height);
+  const { data } = imageData;
+
+  let bgSum = 0;
+  let bgCount = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    const lum = data[i];
+    if (lum >= LIGHT_BG_CUTOFF) {
+      bgSum += lum;
+      bgCount++;
+    }
+  }
+
+  const avgBg = bgCount > 0 ? (bgSum / bgCount) : 245;
+  const threshold = Math.max(120, Math.min(190, Math.round(avgBg - 45)));
+
+  for (let i = 0; i < data.length; i += 4) {
+    const v = data[i] <= threshold ? 0 : 255;
+    data[i] = data[i + 1] = data[i + 2] = v;
+  }
+
+  ctx.putImageData(imageData, 0, 0);
+  return gray;
+}
+
 function detectMlsColumnBounds(baseCanvas) {
   const ctx = baseCanvas.getContext('2d', { willReadFrequently: true });
   const { width, height } = baseCanvas;
@@ -266,16 +295,14 @@ function detectRowBands(columnCanvas) {
 
 function buildOcrVariants(rowCanvas) {
   return [
-    { name: 'raw', canvas: rowCanvas },
-    { name: 'grayscale', canvas: grayscaleCanvas(rowCanvas) },
-    { name: 'enlarged', canvas: scaleCanvas(rowCanvas, 2.2) },
-    { name: 'sharpened', canvas: sharpenCanvas(scaleCanvas(rowCanvas, 2.0), 0.95) },
+    { name: 'thresholded', canvas: thresholdForBlackText(scaleCanvas(rowCanvas, 3.0)) },
+    { name: 'thresholded-sharp', canvas: thresholdForBlackText(sharpenCanvas(scaleCanvas(rowCanvas, 2.6), 1.0)) },
   ];
 }
 
 function normalizeMlsDigits(text) {
   const digits = (text || '').replace(/\D+/g, '');
-  if (digits.length < 7 || digits.length > 8) return null;
+  if (!/^\d{8}$/.test(digits)) return null;
   return digits;
 }
 
