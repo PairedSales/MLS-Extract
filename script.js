@@ -1,35 +1,30 @@
-/* ===== MLS Extract — Client-Side OCR ===== */
+/* ===== MLS Extract — Deterministic 8-Digit OCR ===== */
 
 const $ = (sel) => document.querySelector(sel);
 
 // DOM refs
-const dropZone      = $('#drop-zone');
-const fileInput     = $('#file-input');
-const previewWrap   = $('#preview-wrapper');
-const previewImg    = $('#preview-img');
-const clearBtn      = $('#clear-btn');
-const extractBtn    = $('#extract-btn');
-const outputBox     = $('#output-box');
-const copyBtn       = $('#copy-btn');
-const statusArea    = $('#status-area');
-const progressWrap  = $('#progress-container');
-const progressFill  = $('#progress-fill');
-const progressPct   = $('#progress-pct');
-const countBadge    = $('#count-badge');
-const countNumber   = $('#count-number');
-const resultCard    = $('#result-card');
+const dropZone = $('#drop-zone');
+const fileInput = $('#file-input');
+const previewWrap = $('#preview-wrapper');
+const previewImg = $('#preview-img');
+const clearBtn = $('#clear-btn');
+const extractBtn = $('#extract-btn');
+const outputBox = $('#output-box');
+const copyBtn = $('#copy-btn');
+const statusArea = $('#status-area');
+const progressWrap = $('#progress-container');
+const progressFill = $('#progress-fill');
+const progressPct = $('#progress-pct');
+const countBadge = $('#count-badge');
+const countNumber = $('#count-number');
+const resultCard = $('#result-card');
 
 let currentImageBlob = null;
 
-const OCR_ROW_CONFIDENCE_MIN = 35;
-const ROW_TEXT_DARK_THRESHOLD = 170;
-const ROW_MIN_DARK_PIXELS = 3;
-const ROW_MIN_HEIGHT = 10;
-const ROW_PADDING_Y = 3;
-const ROW_MAX_SCAN_RATIO = 0.9;
-const COLUMN_SEARCH_START = 0.45;
-const COLUMN_SEARCH_END = 0.95;
-const LIGHT_BG_CUTOFF = 240;
+const MIN_BLOB_AREA = 20;
+const MAX_BLOB_WIDTH_RATIO = 0.18;
+const DIGIT_RENDER_W = 24;
+const DIGIT_RENDER_H = 36;
 
 /* ===== Image Input ===== */
 
@@ -39,37 +34,31 @@ document.addEventListener('paste', (e) => {
   for (const item of items) {
     if (item.type.startsWith('image/')) {
       e.preventDefault();
-      const blob = item.getAsFile();
-      handleImageFile(blob);
+      handleImageFile(item.getAsFile());
       return;
     }
   }
 });
 
 fileInput.addEventListener('change', () => {
-  if (fileInput.files.length > 0) {
-    handleImageFile(fileInput.files[0]);
-  }
+  if (fileInput.files.length > 0) handleImageFile(fileInput.files[0]);
 });
 
 dropZone.addEventListener('dragover', (e) => {
   e.preventDefault();
   dropZone.classList.add('drag-over');
 });
-dropZone.addEventListener('dragleave', () => {
-  dropZone.classList.remove('drag-over');
-});
+
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+
 dropZone.addEventListener('drop', (e) => {
   e.preventDefault();
   dropZone.classList.remove('drag-over');
-  if (e.dataTransfer.files.length > 0) {
-    handleImageFile(e.dataTransfer.files[0]);
-  }
+  if (e.dataTransfer.files.length > 0) handleImageFile(e.dataTransfer.files[0]);
 });
 
-clearBtn.addEventListener('click', () => {
-  resetState();
-});
+clearBtn.addEventListener('click', resetState);
+extractBtn.addEventListener('click', runExtraction);
 
 function handleImageFile(file) {
   if (!file || !file.type.startsWith('image/')) {
@@ -78,8 +67,7 @@ function handleImageFile(file) {
   }
 
   currentImageBlob = file;
-  const url = URL.createObjectURL(file);
-  previewImg.src = url;
+  previewImg.src = URL.createObjectURL(file);
   previewWrap.classList.remove('hidden');
   extractBtn.disabled = false;
 
@@ -104,7 +92,7 @@ function resetState() {
   clearStatus();
 }
 
-/* ===== Preprocessing / Segmentation ===== */
+/* ===== Deterministic OCR Core ===== */
 
 function loadImageFromBlob(blob) {
   return new Promise((resolve, reject) => {
@@ -124,191 +112,210 @@ function canvasFromImage(img) {
   return canvas;
 }
 
-function cropCanvas(sourceCanvas, x, y, w, h) {
-  const canvas = document.createElement('canvas');
-  canvas.width = Math.max(1, Math.floor(w));
-  canvas.height = Math.max(1, Math.floor(h));
+function buildBinaryMap(canvas) {
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  ctx.drawImage(sourceCanvas, Math.floor(x), Math.floor(y), Math.floor(w), Math.floor(h), 0, 0, canvas.width, canvas.height);
-  return canvas;
-}
-
-function scaleCanvas(sourceCanvas, scaleFactor) {
-  const canvas = document.createElement('canvas');
-  canvas.width = Math.max(1, Math.floor(sourceCanvas.width * scaleFactor));
-  canvas.height = Math.max(1, Math.floor(sourceCanvas.height * scaleFactor));
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(sourceCanvas, 0, 0, canvas.width, canvas.height);
-  return canvas;
-}
-
-function grayscaleCanvas(sourceCanvas) {
-  const canvas = cropCanvas(sourceCanvas, 0, 0, sourceCanvas.width, sourceCanvas.height);
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const { data } = imageData;
-  for (let i = 0; i < data.length; i += 4) {
-    const lum = Math.round(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
-    data[i] = data[i + 1] = data[i + 2] = lum;
-  }
-  ctx.putImageData(imageData, 0, 0);
-  return canvas;
-}
-
-function sharpenCanvas(sourceCanvas, amount = 0.9) {
-  const canvas = grayscaleCanvas(sourceCanvas);
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const { width, height, data } = imageData;
-  const gray = new Uint8ClampedArray(width * height);
-
-  for (let i = 0; i < data.length; i += 4) gray[i / 4] = data[i];
-
-  for (let y = 1; y < height - 1; y++) {
-    for (let x = 1; x < width - 1; x++) {
-      const idx = y * width + x;
-      const blur = (
-        gray[idx] * 4 +
-        gray[idx - 1] + gray[idx + 1] +
-        gray[idx - width] + gray[idx + width]
-      ) / 8;
-      const value = Math.max(0, Math.min(255, gray[idx] + amount * (gray[idx] - blur)));
-      const p = idx * 4;
-      data[p] = data[p + 1] = data[p + 2] = value;
-    }
-  }
-
-  ctx.putImageData(imageData, 0, 0);
-  return canvas;
-}
-
-function thresholdForBlackText(sourceCanvas) {
-  const gray = grayscaleCanvas(sourceCanvas);
-  const ctx = gray.getContext('2d', { willReadFrequently: true });
-  const imageData = ctx.getImageData(0, 0, gray.width, gray.height);
-  const { data } = imageData;
-
-  let bgSum = 0;
-  let bgCount = 0;
-  for (let i = 0; i < data.length; i += 4) {
-    const lum = data[i];
-    if (lum >= LIGHT_BG_CUTOFF) {
-      bgSum += lum;
-      bgCount++;
-    }
-  }
-
-  const avgBg = bgCount > 0 ? (bgSum / bgCount) : 245;
-  const threshold = Math.max(120, Math.min(190, Math.round(avgBg - 45)));
-
-  for (let i = 0; i < data.length; i += 4) {
-    const v = data[i] <= threshold ? 0 : 255;
-    data[i] = data[i + 1] = data[i + 2] = v;
-  }
-
-  ctx.putImageData(imageData, 0, 0);
-  return gray;
-}
-
-function detectMlsColumnBounds(baseCanvas) {
-  const ctx = baseCanvas.getContext('2d', { willReadFrequently: true });
-  const { width, height } = baseCanvas;
-  const imageData = ctx.getImageData(0, 0, width, height);
-  const { data } = imageData;
-  const colDark = new Float32Array(width);
-
-  for (let x = 0; x < width; x++) {
-    let score = 0;
-    for (let y = 0; y < height; y++) {
-      const p = (y * width + x) * 4;
-      const lum = 0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2];
-      if (lum < 210) score += (210 - lum);
-    }
-    colDark[x] = score;
-  }
-
-  const start = Math.floor(width * COLUMN_SEARCH_START);
-  const end = Math.floor(width * COLUMN_SEARCH_END);
-  let bestX = start;
-  let bestScore = -1;
-  const window = Math.max(30, Math.floor(width * 0.07));
-
-  for (let x = start; x < end - window; x++) {
-    let wScore = 0;
-    for (let i = 0; i < window; i++) wScore += colDark[x + i];
-    if (wScore > bestScore) {
-      bestScore = wScore;
-      bestX = x;
-    }
-  }
-
-  const left = Math.max(0, bestX - Math.floor(window * 0.28));
-  const right = Math.min(width, bestX + Math.floor(window * 1.35));
-  return { x: left, w: Math.max(1, right - left), y: 0, h: height };
-}
-
-function detectRowBands(columnCanvas) {
-  const gray = grayscaleCanvas(columnCanvas);
-  const ctx = gray.getContext('2d', { willReadFrequently: true });
-  const { width, height } = gray;
+  const { width, height } = canvas;
   const { data } = ctx.getImageData(0, 0, width, height);
+  const binary = new Uint8Array(width * height);
 
-  const rowActivity = new Uint16Array(height);
+  let sum = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    sum += lum;
+  }
+  const avgLum = sum / (width * height);
+  const threshold = Math.max(45, Math.min(170, avgLum - 35));
+
   for (let y = 0; y < height; y++) {
-    let darkPixels = 0;
     for (let x = 0; x < width; x++) {
       const p = (y * width + x) * 4;
-      if (data[p] < ROW_TEXT_DARK_THRESHOLD) darkPixels++;
+      const lum = 0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2];
+      binary[y * width + x] = lum < threshold ? 1 : 0;
     }
-    rowActivity[y] = darkPixels;
   }
 
-  const maxScanY = Math.floor(height * ROW_MAX_SCAN_RATIO);
-  const rows = [];
-  let inBand = false;
-  let start = 0;
+  return { binary, width, height };
+}
 
-  for (let y = 0; y < maxScanY; y++) {
-    const active = rowActivity[y] >= ROW_MIN_DARK_PIXELS;
-    if (active && !inBand) {
-      inBand = true;
-      start = y;
-    } else if (!active && inBand) {
-      inBand = false;
-      const end = y;
-      if (end - start >= ROW_MIN_HEIGHT) {
-        rows.push({ y0: Math.max(0, start - ROW_PADDING_Y), y1: Math.min(height, end + ROW_PADDING_Y) });
+function connectedComponents(binary, width, height) {
+  const visited = new Uint8Array(width * height);
+  const blobs = [];
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const start = y * width + x;
+      if (!binary[start] || visited[start]) continue;
+
+      const stack = [start];
+      visited[start] = 1;
+      let minX = x, maxX = x, minY = y, maxY = y, area = 0;
+
+      while (stack.length) {
+        const idx = stack.pop();
+        const px = idx % width;
+        const py = Math.floor(idx / width);
+        area++;
+        if (px < minX) minX = px;
+        if (px > maxX) maxX = px;
+        if (py < minY) minY = py;
+        if (py > maxY) maxY = py;
+
+        const neighbors = [idx - 1, idx + 1, idx - width, idx + width];
+        for (const n of neighbors) {
+          if (n < 0 || n >= binary.length || visited[n] || !binary[n]) continue;
+          const nx = n % width;
+          if (Math.abs(nx - px) > 1) continue;
+          visited[n] = 1;
+          stack.push(n);
+        }
+      }
+
+      const w = maxX - minX + 1;
+      const h = maxY - minY + 1;
+      if (area >= MIN_BLOB_AREA && h > 8 && w > 2 && w <= width * MAX_BLOB_WIDTH_RATIO) {
+        blobs.push({ x: minX, y: minY, w, h, area });
       }
     }
   }
 
-  if (inBand) {
-    const end = maxScanY;
-    if (end - start >= ROW_MIN_HEIGHT) {
-      rows.push({ y0: Math.max(0, start - ROW_PADDING_Y), y1: Math.min(height, end + ROW_PADDING_Y) });
+  return blobs.sort((a, b) => (a.y - b.y) || (a.x - b.x));
+}
+
+function renderDigitTemplate(char) {
+  const c = document.createElement('canvas');
+  c.width = DIGIT_RENDER_W;
+  c.height = DIGIT_RENDER_H;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, c.width, c.height);
+  ctx.fillStyle = '#000';
+  ctx.font = '700 32px Arial';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(char, c.width / 2, c.height / 2 + 1);
+  return toBinary(c);
+}
+
+function toBinary(canvas) {
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  const { width, height } = canvas;
+  const { data } = ctx.getImageData(0, 0, width, height);
+  const out = new Uint8Array(width * height);
+  for (let i = 0; i < data.length; i += 4) out[i / 4] = data[i] < 128 ? 1 : 0;
+  return { data: out, width, height };
+}
+
+const DIGIT_TEMPLATES = Array.from({ length: 10 }, (_, d) => ({ digit: String(d), bmp: renderDigitTemplate(String(d)) }));
+
+function cropToCanvas(binaryMap, blob) {
+  const c = document.createElement('canvas');
+  c.width = blob.w;
+  c.height = blob.h;
+  const ctx = c.getContext('2d');
+  const img = ctx.createImageData(blob.w, blob.h);
+  for (let y = 0; y < blob.h; y++) {
+    for (let x = 0; x < blob.w; x++) {
+      const src = (blob.y + y) * binaryMap.width + (blob.x + x);
+      const v = binaryMap.binary[src] ? 0 : 255;
+      const p = (y * blob.w + x) * 4;
+      img.data[p] = img.data[p + 1] = img.data[p + 2] = v;
+      img.data[p + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  return c;
+}
+
+function resizeBinary(srcCanvas, w, h) {
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  const ctx = c.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(srcCanvas, 0, 0, w, h);
+  return toBinary(c);
+}
+
+function matchDigit(blobCanvas) {
+  const candidate = resizeBinary(blobCanvas, DIGIT_RENDER_W, DIGIT_RENDER_H);
+  let best = { digit: null, score: Number.POSITIVE_INFINITY, second: Number.POSITIVE_INFINITY };
+
+  for (const t of DIGIT_TEMPLATES) {
+    let diff = 0;
+    for (let i = 0; i < candidate.data.length; i++) {
+      if (candidate.data[i] !== t.bmp.data[i]) diff++;
+    }
+    if (diff < best.score) {
+      best.second = best.score;
+      best.score = diff;
+      best.digit = t.digit;
+    } else if (diff < best.second) {
+      best.second = diff;
     }
   }
 
-  return rows;
+  // Deterministic ambiguity handling: 3/8 and 1/7
+  const margin = best.second - best.score;
+  if ((best.digit === '8' || best.digit === '3') && margin < 28) {
+    best.digit = disambiguate38(candidate);
+  }
+  if ((best.digit === '1' || best.digit === '7') && margin < 24) {
+    best.digit = disambiguate17(candidate);
+  }
+
+  return { digit: best.digit, confidence: 1 - best.score / candidate.data.length };
 }
 
-function buildOcrVariants(rowCanvas) {
-  return [
-    { name: 'thresholded', canvas: thresholdForBlackText(scaleCanvas(rowCanvas, 3.0)) },
-    { name: 'thresholded-sharp', canvas: thresholdForBlackText(sharpenCanvas(scaleCanvas(rowCanvas, 2.6), 1.0)) },
-  ];
+function disambiguate38(bmp) {
+  let midGap = 0;
+  const midY = Math.floor(bmp.height / 2);
+  for (let x = 0; x < bmp.width; x++) midGap += bmp.data[midY * bmp.width + x];
+  return midGap > bmp.width * 0.55 ? '8' : '3';
 }
 
-function normalizeMlsDigits(text) {
-  const digits = (text || '').replace(/\D+/g, '');
-  if (!/^\d{8}$/.test(digits)) return null;
-  return digits;
+function disambiguate17(bmp) {
+  let topBar = 0;
+  for (let y = 0; y < Math.floor(bmp.height * 0.2); y++) {
+    for (let x = 0; x < bmp.width; x++) topBar += bmp.data[y * bmp.width + x];
+  }
+  return topBar > bmp.width * 2.2 ? '7' : '1';
+}
+
+function extractEightDigitSequences(blobs, binaryMap) {
+  const annotated = blobs.map((blob) => {
+    const { digit, confidence } = matchDigit(cropToCanvas(binaryMap, blob));
+    return { ...blob, digit, confidence, cx: blob.x + blob.w / 2, cy: blob.y + blob.h / 2 };
+  });
+
+  annotated.sort((a, b) => (a.cy - b.cy) || (a.cx - b.cx));
+  const sequences = [];
+
+  for (let i = 0; i <= annotated.length - 8; i++) {
+    const group = annotated.slice(i, i + 8);
+    const ySpread = Math.max(...group.map((d) => d.cy)) - Math.min(...group.map((d) => d.cy));
+    if (ySpread > Math.max(...group.map((d) => d.h)) * 0.65) continue;
+
+    const gaps = [];
+    for (let g = 1; g < group.length; g++) gaps.push(group[g].x - (group[g - 1].x + group[g - 1].w));
+    const avgGap = gaps.reduce((a, b) => a + b, 0) / gaps.length;
+    if (avgGap < -2 || avgGap > 20) continue;
+
+    const text = group.map((d) => d.digit).join('');
+    if (/^\d{8}$/.test(text)) {
+      const avgConf = group.reduce((a, b) => a + b.confidence, 0) / group.length;
+      sequences.push({ text, y: group[0].y, x: group[0].x, conf: avgConf });
+    }
+  }
+
+  const unique = new Map();
+  for (const s of sequences.sort((a, b) => (a.y - b.y) || (a.x - b.x))) {
+    if (!unique.has(s.text)) unique.set(s.text, s);
+  }
+
+  return [...unique.values()].sort((a, b) => (a.y - b.y) || (a.x - b.x)).map((s) => s.text);
 }
 
 /* ===== OCR Extraction ===== */
-
-extractBtn.addEventListener('click', () => runExtraction());
 
 async function runExtraction() {
   if (!currentImageBlob) return;
@@ -320,82 +327,28 @@ async function runExtraction() {
   outputBox.value = '';
   clearStatus();
   progressWrap.classList.remove('hidden');
-  updateProgress(0);
-
-  let worker;
+  updateProgress(10);
 
   try {
-    showStatus('Preparing image and row segments…', 'info');
+    showStatus('Running deterministic digit scan…', 'info');
     const img = await loadImageFromBlob(currentImageBlob);
-    const baseCanvas = canvasFromImage(img);
-    const column = detectMlsColumnBounds(baseCanvas);
-    const columnCanvas = cropCanvas(baseCanvas, column.x, column.y, column.w, column.h);
-    const rowBands = detectRowBands(columnCanvas);
+    const canvas = canvasFromImage(img);
+    updateProgress(40);
+    const binaryMap = buildBinaryMap(canvas);
+    const blobs = connectedComponents(binaryMap.binary, binaryMap.width, binaryMap.height);
+    updateProgress(70);
+    const results = extractEightDigitSequences(blobs, binaryMap);
+    updateProgress(100);
 
-    if (!rowBands.length) {
-      showStatus('No MLS rows detected in the screenshot.', 'error');
+    if (!results.length) {
+      showStatus('No valid 8-digit MLS numbers detected.', 'error');
       progressWrap.classList.add('hidden');
       return;
     }
 
-    showStatus('Initializing OCR engine…', 'info');
-    worker = await Tesseract.createWorker('eng', 1, {
-      logger: (msg) => {
-        if (msg.status === 'recognizing text') {
-          updateProgress(Math.round(msg.progress * 100));
-        }
-      },
-    });
-
-    await worker.setParameters({
-      tessedit_char_whitelist: '0123456789',
-      tessedit_pageseg_mode: Tesseract.PSM.SINGLE_LINE,
-      preserve_interword_spaces: '0',
-      classify_bln_numeric_mode: '1',
-      load_system_dawg: '0',
-      load_freq_dawg: '0',
-    });
-
-    showStatus('OCR on each MLS row…', 'info');
-
-    const accepted = [];
-    const seen = new Set();
-
-    for (let i = 0; i < rowBands.length; i++) {
-      const band = rowBands[i];
-      const rowCanvas = cropCanvas(columnCanvas, 0, band.y0, columnCanvas.width, band.y1 - band.y0);
-      const variants = buildOcrVariants(rowCanvas);
-
-      let best = { digits: null, confidence: -Infinity };
-
-      for (const variant of variants) {
-        const { data: result } = await worker.recognize(variant.canvas);
-        const digits = normalizeMlsDigits(result.text);
-        const confidence = Number.isFinite(result.confidence) ? result.confidence : -1;
-        if (digits && confidence > best.confidence) {
-          best = { digits, confidence };
-        }
-      }
-
-      if (best.digits && best.confidence >= OCR_ROW_CONFIDENCE_MIN && !seen.has(best.digits)) {
-        seen.add(best.digits);
-        accepted.push(best.digits);
-      }
-
-      const pct = Math.round(((i + 1) / rowBands.length) * 100);
-      updateProgress(Math.max(1, pct));
-    }
-
-    if (accepted.length === 0) {
-      showStatus('No valid MLS numbers passed confidence and format checks.', 'error');
-      progressWrap.classList.add('hidden');
-      return;
-    }
-
-    const formatted = accepted.join(', ');
-    outputBox.value = formatted;
+    outputBox.value = results.join(', ');
     resultCard.classList.remove('hidden');
-    countNumber.textContent = accepted.length;
+    countNumber.textContent = results.length;
     countBadge.classList.remove('hidden');
     copyBtn.disabled = false;
     progressWrap.classList.add('hidden');
@@ -405,9 +358,6 @@ async function runExtraction() {
     showStatus('Text extraction failed. Try a clearer image.', 'error');
     progressWrap.classList.add('hidden');
   } finally {
-    if (worker) {
-      await worker.terminate();
-    }
     extractBtn.disabled = false;
   }
 }
