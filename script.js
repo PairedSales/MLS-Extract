@@ -21,8 +21,6 @@ const resultCard = $('#result-card');
 
 let currentImageBlob = null;
 
-const MIN_BLOB_AREA = 20;
-const MAX_BLOB_WIDTH_RATIO = 0.18;
 const DIGIT_RENDER_W = 24;
 const DIGIT_RENDER_H = 36;
 
@@ -92,8 +90,6 @@ function resetState() {
   clearStatus();
 }
 
-/* ===== Deterministic OCR Core ===== */
-
 function loadImageFromBlob(blob) {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -112,73 +108,85 @@ function canvasFromImage(img) {
   return canvas;
 }
 
-function buildBinaryMap(canvas) {
+function preprocessBinary(canvas) {
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
   const { width, height } = canvas;
-  const { data } = ctx.getImageData(0, 0, width, height);
-  const binary = new Uint8Array(width * height);
+  const img = ctx.getImageData(0, 0, width, height);
+  const d = img.data;
 
   let sum = 0;
-  for (let i = 0; i < data.length; i += 4) {
-    const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-    sum += lum;
-  }
-  const avgLum = sum / (width * height);
-  const threshold = Math.max(45, Math.min(170, avgLum - 35));
-
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const p = (y * width + x) * 4;
-      const lum = 0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2];
-      binary[y * width + x] = lum < threshold ? 1 : 0;
-    }
+  let sq = 0;
+  const lum = new Uint8Array(width * height);
+  for (let i = 0, p = 0; i < d.length; i += 4, p++) {
+    const l = Math.round(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]);
+    lum[p] = l;
+    sum += l;
+    sq += l * l;
   }
 
+  const mean = sum / lum.length;
+  const variance = Math.max(1, sq / lum.length - mean * mean);
+  const std = Math.sqrt(variance);
+  const threshold = Math.max(40, Math.min(190, mean - std * 0.55));
+
+  const binary = new Uint8Array(width * height);
+  for (let i = 0; i < lum.length; i++) binary[i] = lum[i] < threshold ? 1 : 0;
   return { binary, width, height };
 }
 
-function connectedComponents(binary, width, height) {
-  const visited = new Uint8Array(width * height);
-  const blobs = [];
+function findMLSColumn(binaryMap) {
+  const { binary, width, height } = binaryMap;
+  const colInk = new Float32Array(width);
 
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const start = y * width + x;
-      if (!binary[start] || visited[start]) continue;
+  for (let x = 0; x < width; x++) {
+    let ink = 0;
+    for (let y = 0; y < height; y++) ink += binary[y * width + x];
+    colInk[x] = ink / height;
+  }
 
-      const stack = [start];
-      visited[start] = 1;
-      let minX = x, maxX = x, minY = y, maxY = y, area = 0;
+  const windowW = Math.max(80, Math.floor(width * 0.18));
+  let bestStart = 0;
+  let bestScore = -1;
+  let rolling = 0;
 
-      while (stack.length) {
-        const idx = stack.pop();
-        const px = idx % width;
-        const py = Math.floor(idx / width);
-        area++;
-        if (px < minX) minX = px;
-        if (px > maxX) maxX = px;
-        if (py < minY) minY = py;
-        if (py > maxY) maxY = py;
-
-        const neighbors = [idx - 1, idx + 1, idx - width, idx + width];
-        for (const n of neighbors) {
-          if (n < 0 || n >= binary.length || visited[n] || !binary[n]) continue;
-          const nx = n % width;
-          if (Math.abs(nx - px) > 1) continue;
-          visited[n] = 1;
-          stack.push(n);
-        }
-      }
-
-      const w = maxX - minX + 1;
-      const h = maxY - minY + 1;
-      if (area >= MIN_BLOB_AREA && h > 8 && w > 2 && w <= width * MAX_BLOB_WIDTH_RATIO) {
-        blobs.push({ x: minX, y: minY, w, h, area });
-      }
+  for (let x = 0; x < width; x++) {
+    rolling += colInk[x];
+    if (x >= windowW) rolling -= colInk[x - windowW];
+    if (x >= windowW - 1 && rolling > bestScore) {
+      bestScore = rolling;
+      bestStart = x - windowW + 1;
     }
   }
 
-  return blobs.sort((a, b) => (a.y - b.y) || (a.x - b.x));
+  return {
+    x0: Math.max(0, bestStart - 10),
+    x1: Math.min(width - 1, bestStart + windowW + 10)
+  };
+}
+
+function detectTextRows(binaryMap, col) {
+  const { binary, width, height } = binaryMap;
+  const yInk = new Float32Array(height);
+  const span = Math.max(1, col.x1 - col.x0 + 1);
+
+  for (let y = 0; y < height; y++) {
+    let ink = 0;
+    for (let x = col.x0; x <= col.x1; x++) ink += binary[y * width + x];
+    yInk[y] = ink / span;
+  }
+
+  const rows = [];
+  const minInk = 0.03;
+  let start = -1;
+  for (let y = 0; y < height; y++) {
+    if (yInk[y] > minInk && start === -1) start = y;
+    if ((yInk[y] <= minInk || y === height - 1) && start !== -1) {
+      const end = yInk[y] <= minInk ? y - 1 : y;
+      if (end - start >= 10) rows.push({ y0: Math.max(0, start - 2), y1: Math.min(height - 1, end + 2) });
+      start = -1;
+    }
+  }
+  return rows;
 }
 
 function renderDigitTemplate(char) {
@@ -207,112 +215,95 @@ function toBinary(canvas) {
 
 const DIGIT_TEMPLATES = Array.from({ length: 10 }, (_, d) => ({ digit: String(d), bmp: renderDigitTemplate(String(d)) }));
 
-function cropToCanvas(binaryMap, blob) {
-  const c = document.createElement('canvas');
-  c.width = blob.w;
-  c.height = blob.h;
-  const ctx = c.getContext('2d');
-  const img = ctx.createImageData(blob.w, blob.h);
-  for (let y = 0; y < blob.h; y++) {
-    for (let x = 0; x < blob.w; x++) {
-      const src = (blob.y + y) * binaryMap.width + (blob.x + x);
-      const v = binaryMap.binary[src] ? 0 : 255;
-      const p = (y * blob.w + x) * 4;
-      img.data[p] = img.data[p + 1] = img.data[p + 2] = v;
-      img.data[p + 3] = 255;
+function extractRowDigits(binaryMap, col, row) {
+  const { binary, width } = binaryMap;
+  const rowW = col.x1 - col.x0 + 1;
+  const rowH = row.y1 - row.y0 + 1;
+
+  const xInk = new Float32Array(rowW);
+  for (let x = col.x0; x <= col.x1; x++) {
+    let ink = 0;
+    for (let y = row.y0; y <= row.y1; y++) ink += binary[y * width + x];
+    xInk[x - col.x0] = ink / rowH;
+  }
+
+  const segments = [];
+  let start = -1;
+  for (let i = 0; i < xInk.length; i++) {
+    if (xInk[i] > 0.05 && start === -1) start = i;
+    if ((xInk[i] <= 0.05 || i === xInk.length - 1) && start !== -1) {
+      const end = xInk[i] <= 0.05 ? i - 1 : i;
+      if (end - start + 1 >= 4) segments.push({ x0: col.x0 + start, x1: col.x0 + end });
+      start = -1;
     }
   }
-  ctx.putImageData(img, 0, 0);
-  return c;
+
+  let text = '';
+  for (const seg of segments) {
+    const digitCanvas = document.createElement('canvas');
+    digitCanvas.width = seg.x1 - seg.x0 + 1;
+    digitCanvas.height = rowH;
+    const dctx = digitCanvas.getContext('2d');
+    const out = dctx.createImageData(digitCanvas.width, digitCanvas.height);
+
+    for (let y = 0; y < rowH; y++) {
+      for (let x = 0; x < digitCanvas.width; x++) {
+        const src = (row.y0 + y) * width + (seg.x0 + x);
+        const v = binary[src] ? 0 : 255;
+        const p = (y * digitCanvas.width + x) * 4;
+        out.data[p] = out.data[p + 1] = out.data[p + 2] = v;
+        out.data[p + 3] = 255;
+      }
+    }
+    dctx.putImageData(out, 0, 0);
+    text += matchDigit(digitCanvas);
+  }
+
+  return text;
 }
 
-function resizeBinary(srcCanvas, w, h) {
+function matchDigit(canvas) {
   const c = document.createElement('canvas');
-  c.width = w;
-  c.height = h;
+  c.width = DIGIT_RENDER_W;
+  c.height = DIGIT_RENDER_H;
   const ctx = c.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, c.width, c.height);
   ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(srcCanvas, 0, 0, w, h);
-  return toBinary(c);
-}
+  ctx.drawImage(canvas, 0, 0, DIGIT_RENDER_W, DIGIT_RENDER_H);
+  const candidate = toBinary(c);
 
-function matchDigit(blobCanvas) {
-  const candidate = resizeBinary(blobCanvas, DIGIT_RENDER_W, DIGIT_RENDER_H);
-  let best = { digit: null, score: Number.POSITIVE_INFINITY, second: Number.POSITIVE_INFINITY };
-
+  let bestDigit = '0';
+  let best = Number.POSITIVE_INFINITY;
   for (const t of DIGIT_TEMPLATES) {
     let diff = 0;
-    for (let i = 0; i < candidate.data.length; i++) {
-      if (candidate.data[i] !== t.bmp.data[i]) diff++;
-    }
-    if (diff < best.score) {
-      best.second = best.score;
-      best.score = diff;
-      best.digit = t.digit;
-    } else if (diff < best.second) {
-      best.second = diff;
+    for (let i = 0; i < candidate.data.length; i++) if (candidate.data[i] !== t.bmp.data[i]) diff++;
+    if (diff < best) {
+      best = diff;
+      bestDigit = t.digit;
     }
   }
-
-  // Deterministic ambiguity handling: 3/8 and 1/7
-  const margin = best.second - best.score;
-  if ((best.digit === '8' || best.digit === '3') && margin < 28) {
-    best.digit = disambiguate38(candidate);
-  }
-  if ((best.digit === '1' || best.digit === '7') && margin < 24) {
-    best.digit = disambiguate17(candidate);
-  }
-
-  return { digit: best.digit, confidence: 1 - best.score / candidate.data.length };
+  return bestDigit;
 }
 
-function disambiguate38(bmp) {
-  let midGap = 0;
-  const midY = Math.floor(bmp.height / 2);
-  for (let x = 0; x < bmp.width; x++) midGap += bmp.data[midY * bmp.width + x];
-  return midGap > bmp.width * 0.55 ? '8' : '3';
-}
+function extractMLSNumbers(binaryMap) {
+  const col = findMLSColumn(binaryMap);
+  const rows = detectTextRows(binaryMap, col);
+  const unique = new Set();
+  const ordered = [];
 
-function disambiguate17(bmp) {
-  let topBar = 0;
-  for (let y = 0; y < Math.floor(bmp.height * 0.2); y++) {
-    for (let x = 0; x < bmp.width; x++) topBar += bmp.data[y * bmp.width + x];
-  }
-  return topBar > bmp.width * 2.2 ? '7' : '1';
-}
-
-function extractEightDigitSequences(blobs, binaryMap) {
-  const annotated = blobs.map((blob) => {
-    const { digit, confidence } = matchDigit(cropToCanvas(binaryMap, blob));
-    return { ...blob, digit, confidence, cx: blob.x + blob.w / 2, cy: blob.y + blob.h / 2 };
-  });
-
-  annotated.sort((a, b) => (a.cy - b.cy) || (a.cx - b.cx));
-  const sequences = [];
-
-  for (let i = 0; i <= annotated.length - 8; i++) {
-    const group = annotated.slice(i, i + 8);
-    const ySpread = Math.max(...group.map((d) => d.cy)) - Math.min(...group.map((d) => d.cy));
-    if (ySpread > Math.max(...group.map((d) => d.h)) * 0.65) continue;
-
-    const gaps = [];
-    for (let g = 1; g < group.length; g++) gaps.push(group[g].x - (group[g - 1].x + group[g - 1].w));
-    const avgGap = gaps.reduce((a, b) => a + b, 0) / gaps.length;
-    if (avgGap < -2 || avgGap > 20) continue;
-
-    const text = group.map((d) => d.digit).join('');
-    if (/^\d{8}$/.test(text)) {
-      const avgConf = group.reduce((a, b) => a + b.confidence, 0) / group.length;
-      sequences.push({ text, y: group[0].y, x: group[0].x, conf: avgConf });
+  for (const row of rows) {
+    const rowText = extractRowDigits(binaryMap, col, row);
+    const matches = rowText.match(/\b\d{8}\b/g) || [];
+    for (const m of matches) {
+      if (!unique.has(m)) {
+        unique.add(m);
+        ordered.push(m);
+      }
     }
   }
 
-  const unique = new Map();
-  for (const s of sequences.sort((a, b) => (a.y - b.y) || (a.x - b.x))) {
-    if (!unique.has(s.text)) unique.set(s.text, s);
-  }
-
-  return [...unique.values()].sort((a, b) => (a.y - b.y) || (a.x - b.x)).map((s) => s.text);
+  return ordered;
 }
 
 /* ===== OCR Extraction ===== */
@@ -330,14 +321,15 @@ async function runExtraction() {
   updateProgress(10);
 
   try {
-    showStatus('Running deterministic digit scan…', 'info');
+    showStatus('Running deterministic OCR pipeline…', 'info');
     const img = await loadImageFromBlob(currentImageBlob);
     const canvas = canvasFromImage(img);
-    updateProgress(40);
-    const binaryMap = buildBinaryMap(canvas);
-    const blobs = connectedComponents(binaryMap.binary, binaryMap.width, binaryMap.height);
-    updateProgress(70);
-    const results = extractEightDigitSequences(blobs, binaryMap);
+    updateProgress(35);
+
+    const binaryMap = preprocessBinary(canvas);
+    updateProgress(65);
+
+    const results = extractMLSNumbers(binaryMap);
     updateProgress(100);
 
     if (!results.length) {
@@ -352,7 +344,8 @@ async function runExtraction() {
     countBadge.classList.remove('hidden');
     copyBtn.disabled = false;
     progressWrap.classList.add('hidden');
-    showStatus('Extraction complete.', 'success');
+    await copyToClipboard(outputBox.value);
+    showStatus('Extraction complete and copied to clipboard.', 'success');
   } catch (err) {
     console.error('OCR Error:', err);
     showStatus('Text extraction failed. Try a clearer image.', 'error');
@@ -373,7 +366,6 @@ copyBtn.addEventListener('click', async () => {
 async function copyToClipboard(text) {
   try {
     await navigator.clipboard.writeText(text);
-    showStatus('Copied to clipboard ✓', 'success');
     copyBtn.classList.add('copied');
     copyBtn.innerHTML = '<span>✓</span> Copied!';
     setTimeout(() => {
@@ -385,8 +377,6 @@ async function copyToClipboard(text) {
     showStatus('Copy failed — use manual select/copy.', 'error');
   }
 }
-
-/* ===== UI Helpers ===== */
 
 function showStatus(message, type) {
   statusArea.className = `status status--${type}`;
