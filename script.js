@@ -20,6 +20,7 @@ const countNumber = $('#count-number');
 const resultCard = $('#result-card');
 
 let currentImageBlob = null;
+const EXPECTED_SAMPLE_OUTPUT = '12401432, 12487333, 12349664, 12375820';
 
 const DIGIT_RENDER_W = 24;
 const DIGIT_RENDER_H = 36;
@@ -131,7 +132,66 @@ function preprocessBinary(canvas) {
 
   const binary = new Uint8Array(width * height);
   for (let i = 0; i < lum.length; i++) binary[i] = lum[i] < threshold ? 1 : 0;
-  return { binary, width, height };
+  return { binary, width, height, threshold, lum };
+}
+
+function createStageCanvases(sourceCanvas, binaryMap, col) {
+  const { width, height } = sourceCanvas;
+  const srcCtx = sourceCanvas.getContext('2d', { willReadFrequently: true });
+  const srcImg = srcCtx.getImageData(0, 0, width, height);
+
+  const grayscale = document.createElement('canvas');
+  grayscale.width = width;
+  grayscale.height = height;
+  const gctx = grayscale.getContext('2d');
+  const gData = gctx.createImageData(width, height);
+  for (let i = 0, p = 0; i < srcImg.data.length; i += 4, p++) {
+    const l = binaryMap.lum[p];
+    gData.data[i] = gData.data[i + 1] = gData.data[i + 2] = l;
+    gData.data[i + 3] = 255;
+  }
+  gctx.putImageData(gData, 0, 0);
+
+  const contrast = document.createElement('canvas');
+  contrast.width = width;
+  contrast.height = height;
+  const cctx = contrast.getContext('2d');
+  const cData = cctx.createImageData(width, height);
+  for (let i = 0, p = 0; i < srcImg.data.length; i += 4, p++) {
+    const l = binaryMap.lum[p];
+    const boosted = Math.max(0, Math.min(255, (l - 128) * 1.8 + 128));
+    cData.data[i] = cData.data[i + 1] = cData.data[i + 2] = boosted;
+    cData.data[i + 3] = 255;
+  }
+  cctx.putImageData(cData, 0, 0);
+
+  const thresholdCanvas = document.createElement('canvas');
+  thresholdCanvas.width = width;
+  thresholdCanvas.height = height;
+  const tctx = thresholdCanvas.getContext('2d');
+  const tData = tctx.createImageData(width, height);
+  for (let i = 0; i < binaryMap.binary.length; i++) {
+    const v = binaryMap.binary[i] ? 0 : 255;
+    const p = i * 4;
+    tData.data[p] = tData.data[p + 1] = tData.data[p + 2] = v;
+    tData.data[p + 3] = 255;
+  }
+  tctx.putImageData(tData, 0, 0);
+
+  const cropped = document.createElement('canvas');
+  cropped.width = col.x1 - col.x0 + 1;
+  cropped.height = height;
+  const crctx = cropped.getContext('2d');
+  crctx.drawImage(thresholdCanvas, col.x0, 0, cropped.width, height, 0, 0, cropped.width, height);
+
+  return { grayscale, contrast, threshold: thresholdCanvas, cropped };
+}
+
+function downloadCanvas(canvas, filename) {
+  const a = document.createElement('a');
+  a.download = filename;
+  a.href = canvas.toDataURL('image/png');
+  a.click();
 }
 
 function findMLSColumn(binaryMap) {
@@ -291,11 +351,16 @@ function extractMLSNumbers(binaryMap) {
   const rows = detectTextRows(binaryMap, col);
   const unique = new Set();
   const ordered = [];
+  const rawRows = [];
+  const confidence = [];
 
   for (const row of rows) {
     const rowText = extractRowDigits(binaryMap, col, row);
-    const matches = rowText.match(/\b\d{8}\b/g) || [];
+    rawRows.push(rowText);
+    const matches = rowText.match(/\d{8}/g) || [];
     for (const m of matches) {
+      const conf = Math.min(100, Math.round((m.length / Math.max(8, rowText.length)) * 100));
+      confidence.push({ value: m, confidence: conf });
       if (!unique.has(m)) {
         unique.add(m);
         ordered.push(m);
@@ -303,7 +368,17 @@ function extractMLSNumbers(binaryMap) {
     }
   }
 
-  return ordered;
+  return { ordered, col, rawText: rawRows.join('\n'), regexMatches: ordered, confidence };
+}
+
+function printDiagnostics(result) {
+  console.log('RAW OCR:\n' + result.rawText);
+  console.log('\nREGEX MATCHES:\n' + (result.regexMatches.join('\n') || '(none)'));
+  console.log('\nFINAL:\n' + result.ordered.join(', '));
+  if (result.confidence.length) {
+    console.log('\nCONFIDENCE:');
+    result.confidence.forEach((c) => console.log(`${c.value}: ${c.confidence}%`));
+  }
 }
 
 /* ===== OCR Extraction ===== */
@@ -329,18 +404,24 @@ async function runExtraction() {
     const binaryMap = preprocessBinary(canvas);
     updateProgress(65);
 
-    const results = extractMLSNumbers(binaryMap);
+    const result = extractMLSNumbers(binaryMap);
+    const stageCanvases = createStageCanvases(canvas, binaryMap, result.col);
+    downloadCanvas(stageCanvases.grayscale, 'grayscale.png');
+    downloadCanvas(stageCanvases.contrast, 'contrast.png');
+    downloadCanvas(stageCanvases.threshold, 'threshold.png');
+    downloadCanvas(stageCanvases.cropped, 'cropped.png');
+    printDiagnostics(result);
     updateProgress(100);
 
-    if (!results.length) {
+    if (!result.ordered.length) {
       showStatus('No valid 8-digit MLS numbers detected.', 'error');
       progressWrap.classList.add('hidden');
       return;
     }
 
-    outputBox.value = results.join(', ');
+    outputBox.value = result.ordered.join(', ');
     resultCard.classList.remove('hidden');
-    countNumber.textContent = results.length;
+    countNumber.textContent = result.ordered.length;
     countBadge.classList.remove('hidden');
     copyBtn.disabled = false;
     progressWrap.classList.add('hidden');
@@ -354,6 +435,43 @@ async function runExtraction() {
     extractBtn.disabled = false;
   }
 }
+
+async function test_ocr(path = 'Sample Data.png') {
+  console.log(`Running OCR test on: ${path}`);
+  const resp = await fetch(path);
+  const blob = await resp.blob();
+  const img = await loadImageFromBlob(blob);
+  const canvas = canvasFromImage(img);
+  const binaryMap = preprocessBinary(canvas);
+  const result = extractMLSNumbers(binaryMap);
+  const stages = createStageCanvases(canvas, binaryMap, result.col);
+  downloadCanvas(stages.grayscale, 'grayscale.png');
+  downloadCanvas(stages.contrast, 'contrast.png');
+  downloadCanvas(stages.threshold, 'threshold.png');
+  downloadCanvas(stages.cropped, 'cropped.png');
+
+  printDiagnostics(result);
+  const final = result.ordered.join(', ');
+  const expectedSet = new Set(EXPECTED_SAMPLE_OUTPUT.split(', ').map((s) => s.trim()));
+  const actualList = result.ordered;
+  const actualSet = new Set(actualList);
+  const missing = [...expectedSet].filter((x) => !actualSet.has(x));
+  const incorrect = actualList.filter((x) => !expectedSet.has(x));
+  const duplicates = actualList.filter((x, i) => actualList.indexOf(x) !== i);
+
+  console.log('\nEXPECTED:\n' + EXPECTED_SAMPLE_OUTPUT);
+  console.log('ACTUAL:\n' + final);
+  if (final === EXPECTED_SAMPLE_OUTPUT && !duplicates.length) {
+    console.log('PASS');
+  } else {
+    console.log('FAIL');
+    console.log('Missing values:', missing.length ? missing.join(', ') : '(none)');
+    console.log('Incorrect values:', incorrect.length ? incorrect.join(', ') : '(none)');
+    console.log('Duplicate values:', duplicates.length ? duplicates.join(', ') : '(none)');
+  }
+}
+
+window.test_ocr = test_ocr;
 
 /* ===== Clipboard ===== */
 
