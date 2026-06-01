@@ -175,32 +175,39 @@ async function runExtraction() {
     
     console.log('Row detection: Found', rowsToCrop.length, 'rows.');
 
-    // Step 3: Restrict recognition to digits only
+    // Step 3: Restrict recognition to digits only and set PSM to single word
     await worker.setParameters({
       tessedit_char_whitelist: '0123456789',
+      tessedit_pageseg_mode: '8',
     });
 
     const orderedResults = [];
     const unique = new Set();
     
-    // Step 4: Crop and OCR individual rows
+    // Step 4: Crop, scale, and OCR individual rows
     for (let i = 0; i < rowsToCrop.length; i++) {
       const bbox = rowsToCrop[i];
       const pad = 8;
       const cropW = bbox.x1 - bbox.x0 + pad * 2;
       const cropH = bbox.y1 - bbox.y0 + pad * 2;
       
+      // Upscale 3x to improve Tesseract accuracy for small digits
+      const scale = 3;
       const rowCanvas = document.createElement('canvas');
-      rowCanvas.width = cropW;
-      rowCanvas.height = cropH;
+      rowCanvas.width = cropW * scale;
+      rowCanvas.height = cropH * scale;
       const ctx = rowCanvas.getContext('2d');
+      
       // Fill background white
       ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, cropW, cropH);
+      ctx.fillRect(0, 0, rowCanvas.width, rowCanvas.height);
+      
+      // Smooth interpolation often helps Tesseract read upscaled small web fonts
+      ctx.imageSmoothingEnabled = true;
       
       const srcX = Math.max(0, bbox.x0 - pad);
       const srcY = Math.max(0, bbox.y0 - pad);
-      ctx.drawImage(canvas, srcX, srcY, cropW, cropH, 0, 0, cropW, cropH);
+      ctx.drawImage(canvas, srcX, srcY, cropW, cropH, 0, 0, cropW * scale, cropH * scale);
       
       showStatus(`Processing row ${i+1}/${rowsToCrop.length}...`, 'info');
       updateProgress(20 + Math.round((i / rowsToCrop.length) * 80));
