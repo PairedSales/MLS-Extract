@@ -21,9 +21,6 @@ const resultCard = $('#result-card');
 
 let currentImageBlob = null;
 
-const DIGIT_RENDER_W = 24;
-const DIGIT_RENDER_H = 36;
-
 /* ===== Image Input ===== */
 
 document.addEventListener('paste', (e) => {
@@ -108,204 +105,6 @@ function canvasFromImage(img) {
   return canvas;
 }
 
-function preprocessBinary(canvas) {
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  const { width, height } = canvas;
-  const img = ctx.getImageData(0, 0, width, height);
-  const d = img.data;
-
-  let sum = 0;
-  let sq = 0;
-  const lum = new Uint8Array(width * height);
-  for (let i = 0, p = 0; i < d.length; i += 4, p++) {
-    const l = Math.round(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]);
-    lum[p] = l;
-    sum += l;
-    sq += l * l;
-  }
-
-  const mean = sum / lum.length;
-  const variance = Math.max(1, sq / lum.length - mean * mean);
-  const std = Math.sqrt(variance);
-  const threshold = Math.max(40, Math.min(190, mean - std * 0.55));
-
-  const binary = new Uint8Array(width * height);
-  for (let i = 0; i < lum.length; i++) binary[i] = lum[i] < threshold ? 1 : 0;
-  return { binary, width, height };
-}
-
-function findMLSColumn(binaryMap) {
-  const { binary, width, height } = binaryMap;
-  const colInk = new Float32Array(width);
-
-  for (let x = 0; x < width; x++) {
-    let ink = 0;
-    for (let y = 0; y < height; y++) ink += binary[y * width + x];
-    colInk[x] = ink / height;
-  }
-
-  const windowW = Math.max(80, Math.floor(width * 0.18));
-  let bestStart = 0;
-  let bestScore = -1;
-  let rolling = 0;
-
-  for (let x = 0; x < width; x++) {
-    rolling += colInk[x];
-    if (x >= windowW) rolling -= colInk[x - windowW];
-    if (x >= windowW - 1 && rolling > bestScore) {
-      bestScore = rolling;
-      bestStart = x - windowW + 1;
-    }
-  }
-
-  return {
-    x0: Math.max(0, bestStart - 10),
-    x1: Math.min(width - 1, bestStart + windowW + 10)
-  };
-}
-
-function detectTextRows(binaryMap, col) {
-  const { binary, width, height } = binaryMap;
-  const yInk = new Float32Array(height);
-  const span = Math.max(1, col.x1 - col.x0 + 1);
-
-  for (let y = 0; y < height; y++) {
-    let ink = 0;
-    for (let x = col.x0; x <= col.x1; x++) ink += binary[y * width + x];
-    yInk[y] = ink / span;
-  }
-
-  const rows = [];
-  const minInk = 0.03;
-  let start = -1;
-  for (let y = 0; y < height; y++) {
-    if (yInk[y] > minInk && start === -1) start = y;
-    if ((yInk[y] <= minInk || y === height - 1) && start !== -1) {
-      const end = yInk[y] <= minInk ? y - 1 : y;
-      if (end - start >= 10) rows.push({ y0: Math.max(0, start - 2), y1: Math.min(height - 1, end + 2) });
-      start = -1;
-    }
-  }
-  return rows;
-}
-
-function renderDigitTemplate(char) {
-  const c = document.createElement('canvas');
-  c.width = DIGIT_RENDER_W;
-  c.height = DIGIT_RENDER_H;
-  const ctx = c.getContext('2d');
-  ctx.fillStyle = '#fff';
-  ctx.fillRect(0, 0, c.width, c.height);
-  ctx.fillStyle = '#000';
-  ctx.font = '700 32px Arial';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(char, c.width / 2, c.height / 2 + 1);
-  return toBinary(c);
-}
-
-function toBinary(canvas) {
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  const { width, height } = canvas;
-  const { data } = ctx.getImageData(0, 0, width, height);
-  const out = new Uint8Array(width * height);
-  for (let i = 0; i < data.length; i += 4) out[i / 4] = data[i] < 128 ? 1 : 0;
-  return { data: out, width, height };
-}
-
-const DIGIT_TEMPLATES = Array.from({ length: 10 }, (_, d) => ({ digit: String(d), bmp: renderDigitTemplate(String(d)) }));
-
-function extractRowDigits(binaryMap, col, row) {
-  const { binary, width } = binaryMap;
-  const rowW = col.x1 - col.x0 + 1;
-  const rowH = row.y1 - row.y0 + 1;
-
-  const xInk = new Float32Array(rowW);
-  for (let x = col.x0; x <= col.x1; x++) {
-    let ink = 0;
-    for (let y = row.y0; y <= row.y1; y++) ink += binary[y * width + x];
-    xInk[x - col.x0] = ink / rowH;
-  }
-
-  const segments = [];
-  let start = -1;
-  for (let i = 0; i < xInk.length; i++) {
-    if (xInk[i] > 0.05 && start === -1) start = i;
-    if ((xInk[i] <= 0.05 || i === xInk.length - 1) && start !== -1) {
-      const end = xInk[i] <= 0.05 ? i - 1 : i;
-      if (end - start + 1 >= 4) segments.push({ x0: col.x0 + start, x1: col.x0 + end });
-      start = -1;
-    }
-  }
-
-  let text = '';
-  for (const seg of segments) {
-    const digitCanvas = document.createElement('canvas');
-    digitCanvas.width = seg.x1 - seg.x0 + 1;
-    digitCanvas.height = rowH;
-    const dctx = digitCanvas.getContext('2d');
-    const out = dctx.createImageData(digitCanvas.width, digitCanvas.height);
-
-    for (let y = 0; y < rowH; y++) {
-      for (let x = 0; x < digitCanvas.width; x++) {
-        const src = (row.y0 + y) * width + (seg.x0 + x);
-        const v = binary[src] ? 0 : 255;
-        const p = (y * digitCanvas.width + x) * 4;
-        out.data[p] = out.data[p + 1] = out.data[p + 2] = v;
-        out.data[p + 3] = 255;
-      }
-    }
-    dctx.putImageData(out, 0, 0);
-    text += matchDigit(digitCanvas);
-  }
-
-  return text;
-}
-
-function matchDigit(canvas) {
-  const c = document.createElement('canvas');
-  c.width = DIGIT_RENDER_W;
-  c.height = DIGIT_RENDER_H;
-  const ctx = c.getContext('2d');
-  ctx.fillStyle = '#fff';
-  ctx.fillRect(0, 0, c.width, c.height);
-  ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(canvas, 0, 0, DIGIT_RENDER_W, DIGIT_RENDER_H);
-  const candidate = toBinary(c);
-
-  let bestDigit = '0';
-  let best = Number.POSITIVE_INFINITY;
-  for (const t of DIGIT_TEMPLATES) {
-    let diff = 0;
-    for (let i = 0; i < candidate.data.length; i++) if (candidate.data[i] !== t.bmp.data[i]) diff++;
-    if (diff < best) {
-      best = diff;
-      bestDigit = t.digit;
-    }
-  }
-  return bestDigit;
-}
-
-function extractMLSNumbers(binaryMap) {
-  const col = findMLSColumn(binaryMap);
-  const rows = detectTextRows(binaryMap, col);
-  const unique = new Set();
-  const ordered = [];
-
-  for (const row of rows) {
-    const rowText = extractRowDigits(binaryMap, col, row);
-    const matches = rowText.match(/\b\d{8}\b/g) || [];
-    for (const m of matches) {
-      if (!unique.has(m)) {
-        unique.add(m);
-        ordered.push(m);
-      }
-    }
-  }
-
-  return ordered;
-}
-
 /* ===== OCR Extraction ===== */
 
 async function runExtraction() {
@@ -318,29 +117,119 @@ async function runExtraction() {
   outputBox.value = '';
   clearStatus();
   progressWrap.classList.remove('hidden');
-  updateProgress(10);
+  updateProgress(0);
+
+  let worker = null;
 
   try {
-    showStatus('Running deterministic OCR pipeline…', 'info');
+    showStatus('Loading Tesseract...', 'info');
+    worker = await Tesseract.createWorker('eng', 1, {
+      logger: m => {
+        if (m.status === 'recognizing text') updateProgress(Math.round(m.progress * 20));
+      }
+    });
+
     const img = await loadImageFromBlob(currentImageBlob);
     const canvas = canvasFromImage(img);
-    updateProgress(35);
 
-    const binaryMap = preprocessBinary(canvas);
-    updateProgress(65);
+    showStatus('Finding column header...', 'info');
+    
+    // Step 1: Detect MLS Header (Column Detection)
+    const { data: fullData } = await worker.recognize(canvas);
+    console.log('--- RAW OCR FULL OUTPUT ---');
+    console.log(fullData.text);
+    console.log('---------------------------');
+    
+    let headerBox = null;
+    let fallbackColumnX = 0;
+    
+    for (const line of fullData.lines) {
+      const txt = line.text.toUpperCase();
+      if (txt.includes('MLS') || txt.includes('MS#')) {
+        headerBox = line.bbox;
+        console.log('MLS Header Found At:', headerBox);
+        break;
+      }
+    }
+    
+    let rowsToCrop = [];
+    
+    if (headerBox) {
+      // Step 2: Stop using geometric column detection. Find rows aligned with MLS header X-coordinate.
+      for (const line of fullData.lines) {
+        const txt = line.text.toUpperCase();
+        if (txt.includes('MLS') || txt.includes('MS#')) continue;
+        const center = (line.bbox.x0 + line.bbox.x1) / 2;
+        // Check if aligned with header
+        if (center >= headerBox.x0 - 50 && center <= headerBox.x1 + 50) {
+          rowsToCrop.push(line.bbox);
+        }
+      }
+    } else {
+      console.warn('Column detection failed: MLS header not found. Falling back to all potential number rows.');
+      // Fallback: take any line that looks like it has numbers
+      for (const line of fullData.lines) {
+        if (/\d/.test(line.text)) rowsToCrop.push(line.bbox);
+      }
+    }
+    
+    console.log('Row detection: Found', rowsToCrop.length, 'rows.');
 
-    const results = extractMLSNumbers(binaryMap);
+    // Step 3: Restrict recognition to digits only
+    await worker.setParameters({
+      tessedit_char_whitelist: '0123456789',
+    });
+
+    const orderedResults = [];
+    const unique = new Set();
+    
+    // Step 4: Crop and OCR individual rows
+    for (let i = 0; i < rowsToCrop.length; i++) {
+      const bbox = rowsToCrop[i];
+      const pad = 8;
+      const cropW = bbox.x1 - bbox.x0 + pad * 2;
+      const cropH = bbox.y1 - bbox.y0 + pad * 2;
+      
+      const rowCanvas = document.createElement('canvas');
+      rowCanvas.width = cropW;
+      rowCanvas.height = cropH;
+      const ctx = rowCanvas.getContext('2d');
+      // Fill background white
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, cropW, cropH);
+      
+      const srcX = Math.max(0, bbox.x0 - pad);
+      const srcY = Math.max(0, bbox.y0 - pad);
+      ctx.drawImage(canvas, srcX, srcY, cropW, cropH, 0, 0, cropW, cropH);
+      
+      showStatus(`Processing row ${i+1}/${rowsToCrop.length}...`, 'info');
+      updateProgress(20 + Math.round((i / rowsToCrop.length) * 80));
+      
+      const { data: rowData } = await worker.recognize(rowCanvas);
+      const rawText = rowData.text.trim();
+      console.log(`Raw OCR Output [Row ${i}]:`, rawText);
+      
+      // Step 5: Parsing & Validation
+      const matches = rawText.match(/\b\d{8}\b/g) || [];
+      for (const m of matches) {
+        if (!unique.has(m)) {
+          unique.add(m);
+          orderedResults.push(m);
+        }
+      }
+    }
+    
     updateProgress(100);
 
-    if (!results.length) {
+    if (!orderedResults.length) {
       showStatus('No valid 8-digit MLS numbers detected.', 'error');
       progressWrap.classList.add('hidden');
       return;
     }
 
-    outputBox.value = results.join(', ');
+    outputBox.value = orderedResults.join(', ');
     resultCard.classList.remove('hidden');
-    countNumber.textContent = results.length;
+    countNumber.textContent = orderedResults.length;
     countBadge.classList.remove('hidden');
     copyBtn.disabled = false;
     progressWrap.classList.add('hidden');
@@ -351,6 +240,7 @@ async function runExtraction() {
     showStatus('Text extraction failed. Try a clearer image.', 'error');
     progressWrap.classList.add('hidden');
   } finally {
+    if (worker) await worker.terminate();
     extractBtn.disabled = false;
   }
 }

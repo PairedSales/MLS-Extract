@@ -1,0 +1,26 @@
+{
+  "name": "mls-extract",
+  "version": "1.0.0",
+  "description": "",
+  "main": "script.js",
+  "scripts": {
+    "test": "node test-pup.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PairedSales/MLS-Extract.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/PairedSales/MLS-Extract/issues"
+  },
+  "homepage": "https://github.com/PairedSales/MLS-Extract#readme",
+  "dependencies": {
+    "canvas": "^3.2.3",
+    "puppeteer": "^25.1.0",
+    "tesseract.js": "^7.0.0"
+  }
+}
