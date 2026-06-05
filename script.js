@@ -18,6 +18,7 @@ const CFG = {
 
   /* Classification thresholds */
   MIN_COMBINED: 0.35,           // Min combined score to accept a digit
+  MIN_DIGIT_SCORE: 0.60,        // Min combined score for ANY digit in a valid row
   MIN_MARGIN: 0.02,             // Min gap between 1st and 2nd combined scores
   NCC_WEIGHT: 0.8,              // Weight of NCC in combined score
   STRUCTURAL_WEIGHT: 0.2,       // Weight of structural features in combined score
@@ -26,7 +27,7 @@ const CFG = {
   CONFUSABLE_MARGIN: 0.05,
   CONFUSABLE_PAIRS: [
     [0, 9], [0, 8], [3, 5], [3, 8],
-    [5, 6], [6, 9], [1, 7],
+    [5, 6], [6, 9], [1, 7], [8, 9],
   ],
 
   /* Segmentation */
@@ -40,6 +41,14 @@ const CFG = {
   REFINE_SCORE: 0.80,           // Min combined score for bank accumulation
   REFINE_MARGIN: 0.18,          // Min margin for bank accumulation
   DEDUP_THRESHOLD: 0.97,        // NCC threshold to reject near-duplicate templates
+
+  /* Robust hole analysis (multi-threshold + morphological closing) */
+  HOLE_THRESHOLDS: [0.40],
+  HOLE_MATCH_BOOST: 0.04,         // Combined score bonus when hole count matches template
+  HOLE_MISMATCH_PENALTY: 0.02,    // Combined score penalty on hole count mismatch
+
+  /* Sub-pixel alignment: ±1px shifts for NCC matching */
+  NCC_SHIFT_OFFSETS: [[0,0], [1,0], [-1,0], [0,1], [0,-1]],
 
   /* Reference image */
   REF_IMAGE: 'reference-digits.png',
@@ -656,7 +665,7 @@ async function loadReferenceTemplates() {
 
     /* Normalize from GRAYSCALE canvas (preserves anti-alias gradients) */
     const glyph = normalizeGlyph(grayCanvas, bb.x, bb.y, bb.w, bb.h);
-    const features = computeStructuralFeatures(glyph.binary, CFG.NORM_W, CFG.NORM_H);
+    const features = computeStructuralFeatures(glyph.binary, CFG.NORM_W, CFG.NORM_H, glyph.grayscale);
 
     bank[digit].push({
       grayscale: glyph.grayscale,
@@ -679,7 +688,7 @@ async function loadReferenceTemplates() {
     throw new Error(`Missing templates for digits: ${missing.join(', ')}`);
   }
 
-  console.log(`[Templates] Bank loaded: 10 digits, 1 template each (reference)`);
+  console.log(`[Templates] Bank loaded: 10 digits, 1 reference template each`);
   return bank;
 }
 
@@ -767,10 +776,42 @@ function ncc(a, b) {
 }
 
 /**
+ * NCC with sub-pixel shift: correlate a[y][x] against b[y+dy][x+dx]
+ * over their overlapping region. Returns NCC in [-1, 1].
+ */
+function shiftedNCC(a, b, W, H, dx, dy) {
+  const x0 = Math.max(0, -dx), y0 = Math.max(0, -dy);
+  const x1 = Math.min(W, W - dx), y1 = Math.min(H, H - dy);
+  const count = (x1 - x0) * (y1 - y0);
+  if (count <= 0) return -1;
+  let sA = 0, sB = 0;
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      sA += a[y * W + x];
+      sB += b[(y + dy) * W + (x + dx)];
+    }
+  }
+  const mA = sA / count, mB = sB / count;
+  let num = 0, dA = 0, dB = 0;
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      const da = a[y * W + x] - mA;
+      const db = b[(y + dy) * W + (x + dx)] - mB;
+      num += da * db;
+      dA += da * da;
+      dB += db * db;
+    }
+  }
+  const den = Math.sqrt(dA * dB);
+  return den < 1e-10 ? 0 : num / den;
+}
+
+/**
  * Compute structural features from a binary glyph (1 = ink, 0 = bg).
  * Used alongside NCC for robust classification.
+ * If grayscale is provided, uses multi-threshold robust hole counting.
  */
-function computeStructuralFeatures(binary, W, H) {
+function computeStructuralFeatures(binary, W, H, grayscale) {
   const n = W * H;
   const halfH = Math.floor(H / 2);
 
@@ -812,10 +853,18 @@ function computeStructuralFeatures(binary, W, H) {
   const bboxH = y1 >= 0 ? y1 - y0 + 1 : 1;
   const aspectRatio = bboxW / bboxH;
 
-  /* Hole count via flood-fill */
-  const holeCount = countHoles(binary, W, H);
+  /* Hole count — robust multi-threshold with morphological closing */
+  let holeCount, holeDetail;
+  if (grayscale) {
+    const hResult = robustHoleCount(grayscale, W, H);
+    holeCount = hResult.max;
+    holeDetail = hResult;
+  } else {
+    holeCount = countHoles(binary, W, H);
+    holeDetail = { max: holeCount, perThreshold: [] };
+  }
 
-  return { density, upperDensity, lowerDensity, aspectRatio, holeCount };
+  return { density, upperDensity, lowerDensity, aspectRatio, holeCount, holeDetail };
 }
 
 /**
@@ -878,6 +927,126 @@ function countHoles(binary, W, H) {
 }
 
 /**
+ * Morphological closing (dilate → erode) with a 3×3 cross structuring element.
+ * Bridges 1px gaps in thin strokes (e.g., middle bar of '8').
+ */
+function morphClose(binary, W, H) {
+  const n = W * H;
+  /* Dilate: pixel is ink if it or any 4-neighbor is ink */
+  const dilated = new Uint8Array(n);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x;
+      if (binary[i] === 1 ||
+          (x > 0 && binary[i - 1] === 1) ||
+          (x < W - 1 && binary[i + 1] === 1) ||
+          (y > 0 && binary[i - W] === 1) ||
+          (y < H - 1 && binary[i + W] === 1)) {
+        dilated[i] = 1;
+      }
+    }
+  }
+  /* Erode: pixel is ink only if it and all existing 4-neighbors are ink */
+  const closed = new Uint8Array(n);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x;
+      if (dilated[i] !== 1) continue;
+      if ((x === 0 || dilated[i - 1] === 1) &&
+          (x === W - 1 || dilated[i + 1] === 1) &&
+          (y === 0 || dilated[i - W] === 1) &&
+          (y === H - 1 || dilated[i + W] === 1)) {
+        closed[i] = 1;
+      }
+    }
+  }
+  return closed;
+}
+
+/**
+ * Robust hole counting: multi-threshold approach WITHOUT morphological closing.
+ * Tries multiple binarization thresholds and takes the maximum hole count.
+ *
+ * At lower thresholds (0.35, 0.40), more pixels count as ink, which
+ * naturally bridges thin strokes like 8's waist. Meanwhile 9's opening
+ * remains open because it's a true structural gap, not a thin stroke.
+ * Returns { max, perThreshold }.
+ */
+function robustHoleCount(grayscale, W, H) {
+  let max = 0;
+  const perThreshold = [];
+
+  for (const thr of CFG.HOLE_THRESHOLDS) {
+    const bin = new Uint8Array(W * H);
+    for (let i = 0; i < W * H; i++) {
+      bin[i] = grayscale[i] > thr ? 1 : 0;
+    }
+    const holes = countHolesMinSize(bin, W, H, 3);
+    perThreshold.push([thr, holes]);
+    if (holes > max) max = holes;
+  }
+
+  return { max, perThreshold };
+}
+
+/**
+ * Count holes with a minimum size filter.
+ * Same as countHoles but only counts background regions with >= minSize pixels.
+ * This prevents tiny 1-2px noise holes from being counted.
+ */
+function countHolesMinSize(binary, W, H, minSize) {
+  const visited = new Uint8Array(W * H);
+  for (let i = 0; i < W * H; i++) {
+    if (binary[i] === 1) visited[i] = 1;
+  }
+
+  /* Flood-fill outside from border */
+  const queue = [];
+  const tryEnqueue = (x, y) => {
+    if (x >= 0 && x < W && y >= 0 && y < H) {
+      const i = y * W + x;
+      if (!visited[i]) { visited[i] = 1; queue.push(i); }
+    }
+  };
+  for (let x = 0; x < W; x++) { tryEnqueue(x, 0); tryEnqueue(x, H - 1); }
+  for (let y = 1; y < H - 1; y++) { tryEnqueue(0, y); tryEnqueue(W - 1, y); }
+  let qi = 0;
+  while (qi < queue.length) {
+    const idx = queue[qi++];
+    const x = idx % W, y = (idx - x) / W;
+    tryEnqueue(x - 1, y); tryEnqueue(x + 1, y);
+    tryEnqueue(x, y - 1); tryEnqueue(x, y + 1);
+  }
+
+  /* Count remaining unvisited regions, filtering by size */
+  let holes = 0;
+  for (let i = 0; i < W * H; i++) {
+    if (!visited[i]) {
+      /* Flood-fill this region and count its size */
+      const hq = [i];
+      visited[i] = 1;
+      let hi = 0;
+      while (hi < hq.length) {
+        const idx = hq[hi++];
+        const x = idx % W, y = (idx - x) / W;
+        for (const [dx, dy] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
+          const nx = x + dx, ny = y + dy;
+          if (nx >= 0 && nx < W && ny >= 0 && ny < H) {
+            const ni = ny * W + nx;
+            if (!visited[ni]) { visited[ni] = 1; hq.push(ni); }
+          }
+        }
+      }
+      if (hq.length >= minSize) holes++;
+    }
+  }
+  return holes;
+}
+
+/** Canonical expected hole counts per digit (for structural discrimination) */
+const CANONICAL_HOLES = { 0: 1, 1: 0, 2: 0, 3: 0, 4: 1, 5: 0, 6: 1, 7: 0, 8: 2, 9: 1 };
+
+/**
  * Compute structural similarity between a candidate and a template.
  * Returns score in [0, 1] where 1 = perfect structural match.
  */
@@ -904,29 +1073,70 @@ function structuralScore(candidateFeatures, templateFeatures) {
 
 /**
  * Classify a normalized glyph against the template bank.
- * Combines grayscale NCC (80%) with structural features (20%).
+ * Combines grayscale NCC (with ±1px shifts), structural features,
+ * and hole-match bias for robust digit discrimination.
  *
  * Returns { digit, score, nccScore, structScore, margin, top3, allScores, features }.
  */
 function classifyGlyph(glyph, bank) {
   const results = [];
+  const { NORM_W: W, NORM_H: H } = CFG;
+  const candHoles = glyph.features.holeCount;
 
   for (let d = 0; d <= 9; d++) {
-    let bestCombined = -Infinity, bestNCC = -Infinity, bestStruct = 0;
+    let bestCombined = -Infinity, bestNCC_val = -Infinity, bestStruct = 0;
 
     for (const tmpl of bank[d]) {
-      const nccS = ncc(glyph.grayscale, tmpl.grayscale);
+      /* Shifted NCC: try original + ±1px offsets, take best */
+      let nccS = ncc(glyph.grayscale, tmpl.grayscale);
+      for (const [dx, dy] of CFG.NCC_SHIFT_OFFSETS) {
+        if (dx === 0 && dy === 0) continue;
+        const s = shiftedNCC(glyph.grayscale, tmpl.grayscale, W, H, dx, dy);
+        if (s > nccS) nccS = s;
+      }
+
       const strS = structuralScore(glyph.features, tmpl.features);
-      const combined = nccS * CFG.NCC_WEIGHT + strS * CFG.STRUCTURAL_WEIGHT;
+      let combined = nccS * CFG.NCC_WEIGHT + strS * CFG.STRUCTURAL_WEIGHT;
+
+      /* Hole-match bias: small boost/penalty based on hole count agreement.
+       * This biases, not overrides — magnitudes are small relative to NCC. */
+      const tmplHoles = tmpl.features.holeCount;
+      if (candHoles === tmplHoles) {
+        combined += CFG.HOLE_MATCH_BOOST;
+      } else if (Math.abs(candHoles - tmplHoles) >= 1) {
+        combined -= CFG.HOLE_MISMATCH_PENALTY;
+      }
+
+      /* Vertical density balance bias for 8/9 discrimination.
+       * 8 is vertically balanced (upper/lower ratio ~0.8–1.2).
+       * 9 is top-heavy (ratio > 1.2). Apply a small bias accordingly. */
+      if (d === 8 || d === 9) {
+        const ud = glyph.features.upperDensity;
+        const ld = glyph.features.lowerDensity;
+        const balance = ld > 0.001 ? ud / ld : 10;
+        if (d === 8 && balance > 1.2) {
+          /* Glyph is top-heavy: penalize 8 (which should be balanced) */
+          combined -= 0.01;
+        } else if (d === 9 && balance > 1.2) {
+          /* Glyph is top-heavy: boost 9 (which is top-heavy) */
+          combined += 0.01;
+        } else if (d === 9 && balance <= 1.2) {
+          /* Glyph is balanced: penalize 9 (which should be top-heavy) */
+          combined -= 0.01;
+        } else if (d === 8 && balance <= 1.2) {
+          /* Glyph is balanced: boost 8 (which should be balanced) */
+          combined += 0.01;
+        }
+      }
 
       if (combined > bestCombined) {
         bestCombined = combined;
-        bestNCC = nccS;
+        bestNCC_val = nccS;
         bestStruct = strS;
       }
     }
 
-    results.push({ d, combined: bestCombined, ncc: bestNCC, structural: bestStruct });
+    results.push({ d, combined: bestCombined, ncc: bestNCC_val, structural: bestStruct });
   }
 
   results.sort((a, b) => b.combined - a.combined);
@@ -952,6 +1162,9 @@ function classifyGlyph(glyph, bank) {
 /**
  * Determine if a classification result is too ambiguous to trust.
  * Favors false negatives over false positives.
+ * Uses hole-count discrimination to relax confusable-pair margins when
+ * structural features provide strong evidence.
+ * For 8/9 confusion: uses vertical density balance to discriminate.
  */
 function isAmbiguous(result) {
   /* Hard rejection: below minimum thresholds */
@@ -962,7 +1175,36 @@ function isAmbiguous(result) {
   const top2 = [result.top3[0].d, result.top3[1].d];
   for (const [a, b] of CFG.CONFUSABLE_PAIRS) {
     if (top2.includes(a) && top2.includes(b)) {
-      if (result.margin < CFG.CONFUSABLE_MARGIN) {
+      let effectiveMargin = CFG.CONFUSABLE_MARGIN;
+
+      /* Relax margin when hole count definitively discriminates.
+       * Only when candidate holes match top but not second candidate. */
+      const candHoles = result.features.holeCount;
+      const topExpected = CANONICAL_HOLES[result.top3[0].d];
+      const secExpected = CANONICAL_HOLES[result.top3[1].d];
+      if (topExpected !== secExpected &&
+          candHoles === topExpected && candHoles !== secExpected) {
+        effectiveMargin = CFG.MIN_MARGIN;
+      }
+
+      /* Special 8/9 discrimination via vertical density balance.
+       * 8 has balanced upper/lower density (ratio ~0.8–1.2).
+       * 9 is top-heavy (upper density >> lower density, ratio > 1.15).
+       * If the top pick is 8 but vertical balance suggests 9, require wide margin. */
+      if (top2.includes(8) && top2.includes(9)) {
+        const ud = result.features.upperDensity;
+        const ld = result.features.lowerDensity;
+        const balance = ld > 0.001 ? ud / ld : 10;
+        if (result.top3[0].d === 8 && balance > 1.15) {
+          /* Glyph is top-heavy like a 9, but classified as 8 — require strict margin */
+          effectiveMargin = Math.max(effectiveMargin, 0.20);
+        } else if (result.top3[0].d === 9 && balance < 1.15) {
+          /* Glyph is balanced like an 8, but classified as 9 — require strict margin */
+          effectiveMargin = Math.max(effectiveMargin, 0.20);
+        }
+      }
+
+      if (result.margin < effectiveMargin) {
         return `confusable-${a}/${b}`;
       }
     }
@@ -1137,9 +1379,16 @@ function renderDebugTable(rowResults, perfTimings) {
         tdMargin.className = dd.classification ? marginClass(dd.classification.margin) : '';
         tr.appendChild(tdMargin);
 
-        /* Holes */
+        /* Holes (with per-threshold detail on hover) */
         const tdHoles = document.createElement('td');
-        tdHoles.textContent = dd.classification?.features?.holeCount ?? '—';
+        const holeDetail = dd.classification?.features?.holeDetail;
+        if (holeDetail && holeDetail.perThreshold && holeDetail.perThreshold.length > 0) {
+          tdHoles.textContent = `${holeDetail.max}`;
+          tdHoles.title = holeDetail.perThreshold.map(([t, h]) => `thr=${t}→${h}holes`).join(', ');
+          tdHoles.style.cursor = 'help';
+        } else {
+          tdHoles.textContent = dd.classification?.features?.holeCount ?? '—';
+        }
         tr.appendChild(tdHoles);
 
         /* Density */
@@ -1239,7 +1488,7 @@ function recognizeRows(rows, bin, grayCanvas, bank, tag) {
 
       /* Normalize from GRAYSCALE canvas */
       const glyph = normalizeGlyph(grayCanvas, bb.x, bb.y, bb.w, bb.h);
-      glyph.features = computeStructuralFeatures(glyph.binary, CFG.NORM_W, CFG.NORM_H);
+      glyph.features = computeStructuralFeatures(glyph.binary, CFG.NORM_W, CFG.NORM_H, glyph.grayscale);
 
       /* Classify */
       const cls = classifyGlyph(glyph, bank);
@@ -1284,6 +1533,17 @@ function recognizeRows(rows, bin, grayCanvas, bank, tag) {
     if (num.length !== 8 || !/^\d{8}$/.test(num)) {
       rr.status = anyAmbiguous ? 'rejected-ambiguous' : 'rejected-format';
       console.log(`  → REJECTED: ${rr.status}`);
+      rowResults.push(rr);
+      continue;
+    }
+
+    /* Reject rows where any digit has very low confidence (e.g., header rows) */
+    const minDigitScore = Math.min(...rr.digits
+      .filter(dd => dd.classification)
+      .map(dd => dd.classification.score));
+    if (minDigitScore < CFG.MIN_DIGIT_SCORE) {
+      rr.status = 'rejected-low-confidence';
+      console.log(`  → REJECTED: min digit score ${minDigitScore.toFixed(2)} < ${CFG.MIN_DIGIT_SCORE}`);
       rowResults.push(rr);
       continue;
     }
@@ -1401,26 +1661,41 @@ async function runExtraction() {
     perf.classification_p2 = Perf.end('classification_p2');
     updateProgress(85);
 
-    /* --- Choose best result set (anti-poisoning check) --- */
-    const p2SupersetOfP1 = p1.accepted.every(n => p2.accepted.includes(n));
-    let results, finalRowResults, passUsed;
+    /* --- Conservative P1/P2 merge ---
+     * P1 accepted results are NEVER overridden.
+     * P2 may ADD numbers from rows that P1 rejected, but only if P2
+     * accepted them with all digits having margin ≥ CONFUSABLE_MARGIN. */
+    const p1Set = new Set(p1.accepted);
+    const mergedResults = [...p1.accepted];
+    const mergedRowResults = p1.rowResults.map(rr => ({ ...rr }));
+    let p2Additions = 0;
 
-    if (p2SupersetOfP1 && p2.accepted.length >= p1.accepted.length) {
-      results = p2.accepted;
-      finalRowResults = p2.rowResults;
-      passUsed = 'P2';
-    } else {
-      results = p1.accepted;
-      finalRowResults = p1.rowResults;
-      passUsed = 'P1';
-      if (!p2SupersetOfP1) {
-        console.log('[Result] P2 changed P1 numbers (poisoning risk) — using P1');
+    for (let i = 0; i < p2.rowResults.length; i++) {
+      const p2rr = p2.rowResults[i];
+      const p1rr = p1.rowResults[i];
+      const p1Acc = p1rr.status === 'accepted' || p1rr.status === 'accepted-pass2';
+      const p2Acc = p2rr.status === 'accepted' || p2rr.status === 'accepted-pass2';
+
+      if (!p1Acc && p2Acc && p2rr.result && /^\d{8}$/.test(p2rr.result)) {
+        const allConfident = p2rr.digits.every(dd =>
+          dd.classification && dd.classification.margin >= CFG.CONFUSABLE_MARGIN
+        );
+        if (allConfident && !p1Set.has(p2rr.result)) {
+          mergedResults.push(p2rr.result);
+          p1Set.add(p2rr.result);
+          mergedRowResults[i] = { ...p2rr, status: 'accepted-pass2' };
+          p2Additions++;
+          console.log(`[Merge] P2 recovered row ${i}: ${p2rr.result}`);
+        }
       }
     }
-    console.log(`[Result] Using ${passUsed}: ${results.length} MLS numbers`);
+
+    const results = mergedResults;
+    const finalRowResults = mergedRowResults;
+    console.log(`[Result] P1: ${p1.accepted.length}, P2 additions: ${p2Additions}, total: ${results.length}`);
 
     /* --- Accumulate to persistent bank (for next extraction) --- */
-    const glyphsForBank = passUsed === 'P2' ? p2.allGlyphs : p1.allGlyphs;
+    const glyphsForBank = p1.allGlyphs;
     let persisted = 0;
     for (const g of glyphsForBank) {
       if (g.score >= CFG.REFINE_SCORE && g.margin >= CFG.REFINE_MARGIN) {
