@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MLS Extract — OCR MLS Number Extractor</title>
-  <meta name="description" content="Extract MLS numbers from screenshots using client-side OCR. Paste or upload an image and get formatted MLS numbers copied to your clipboard instantly." />
+  <title>MLS Extract — Template-Matching MLS Number Extractor</title>
+  <meta name="description" content="Extract MLS numbers from screenshots using deterministic template matching. Paste or upload an image and get formatted MLS numbers copied to your clipboard instantly." />
 
   <!-- Fonts -->
   <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -83,9 +83,21 @@
       </div>
     </section>
 
+    <!-- Debug Card -->
+    <section class="card hidden" id="debug-card">
+      <div class="card__title debug-toggle" id="debug-toggle">
+        <span>🔬</span> Debug Details
+        <span class="debug-chevron">▸</span>
+      </div>
+      <div class="debug-body hidden" id="debug-body">
+        <canvas id="debug-canvas"></canvas>
+        <div id="debug-rows"></div>
+      </div>
+    </section>
+
     <!-- Footer -->
     <footer class="app-footer">
-      Powered by deterministic client-side digit matching — 100% local, no data leaves your browser.
+      Powered by deterministic client-side template matching — 100% local, no data leaves your browser.
     </footer>
 
   </div>

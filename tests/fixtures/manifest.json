@@ -1,0 +1,7 @@
+[
+  {
+    "file": "clean/Sample.png",
+    "label": "Sample — 4 MLS numbers, clean screenshot",
+    "expected": ["12401432", "12487333", "12349664", "12375820"]
+  }
+]
