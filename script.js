@@ -564,6 +564,22 @@ function normalizeGlyph(srcCanvas, sx, sy, sw, sh) {
     /* Luminance → inverted (ink = 1.0, bg = 0.0) */
     const lum = (0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2]) / 255;
     grayscale[i] = 1.0 - lum;
+  }
+
+  /* Contrast stretching: map min grayscale to 0.0 and max to 1.0 if range is significant */
+  let minG = 1.0, maxG = 0.0;
+  for (let i = 0; i < n; i++) {
+    if (grayscale[i] < minG) minG = grayscale[i];
+    if (grayscale[i] > maxG) maxG = grayscale[i];
+  }
+  const rangeG = maxG - minG;
+  if (rangeG > 0.15) {
+    for (let i = 0; i < n; i++) {
+      grayscale[i] = (grayscale[i] - minG) / rangeG;
+    }
+  }
+
+  for (let i = 0; i < n; i++) {
     binary[i] = grayscale[i] > 0.5 ? 1 : 0;
   }
 
