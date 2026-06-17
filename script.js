@@ -87,6 +87,7 @@ const debugCanvasEl = $('#debug-canvas');
 const debugRowsEl   = $('#debug-rows');
 
 let currentImageBlob = null;
+let valueToCopy = '';
 
 /* Paste handler */
 document.addEventListener('paste', (e) => {
@@ -610,8 +611,82 @@ let _templateBank = null;
 let _templateBankPromise = null;
 
 /**
+ * Load a template from a 24x32 or arbitrary size image file.
+ * Automatically extracts the tight bbox and normalizes to NORM_W x NORM_H.
+ */
+async function loadTemplateFromImage(srcPath, rx = 0) {
+  const img = await loadImage(srcPath);
+  const c = canvasFromImage(img);
+  toGrayscale(c);
+  const binCanvas = cloneCanvas(c);
+  binarize(binCanvas);
+  const bin = getBinary(binCanvas);
+
+  const bb = tightBBox(bin, c.width, rx, 0, c.width - rx, c.height);
+  if (!bb || bb.w < 2 || bb.h < 2) {
+    throw new Error(`Failed to find tight bbox for template image: ${srcPath}`);
+  }
+
+  const glyph = normalizeGlyph(c, bb.x, bb.y, bb.w, bb.h);
+  const features = computeStructuralFeatures(glyph.binary, CFG.NORM_W, CFG.NORM_H, glyph.grayscale);
+  return {
+    grayscale: glyph.grayscale,
+    binary: glyph.binary,
+    features,
+    score: 1.0,
+    isReference: true,
+  };
+}
+
+/**
+ * Dynamically render a character on a canvas and normalize it as a template.
+ */
+function createSynthesizedTemplate(char, fontWeight = 'bold', fontSize = 36) {
+  const c = document.createElement('canvas');
+  c.width = 100;
+  c.height = 100;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+
+  // Fill white
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, c.width, c.height);
+
+  // Draw black text
+  ctx.fillStyle = '#000000';
+  ctx.font = `${fontWeight} ${fontSize}px Arial, "Helvetica Neue", Helvetica, sans-serif`;
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'center';
+  ctx.fillText(char, c.width / 2, c.height / 2);
+
+  // Binarize to find bbox
+  const imgData = ctx.getImageData(0, 0, c.width, c.height);
+  const d = imgData.data;
+  const bin = new Uint8Array(c.width * c.height);
+  for (let i = 0; i < d.length; i += 4) {
+    const g = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+    bin[i / 4] = g < 128 ? 0 : 1; // 0 = ink
+  }
+
+  const bb = tightBBox(bin, c.width, 0, 0, c.width, c.height);
+  if (!bb) {
+    throw new Error(`Failed to find bounding box for synthesized character: ${char}`);
+  }
+
+  const glyph = normalizeGlyph(c, bb.x, bb.y, bb.w, bb.h);
+  const features = computeStructuralFeatures(glyph.binary, CFG.NORM_W, CFG.NORM_H, glyph.grayscale);
+  return {
+    grayscale: glyph.grayscale,
+    binary: glyph.binary,
+    features,
+    score: 1.0,
+    isReference: true,
+  };
+}
+
+/**
  * Load the canonical reference image and segment it into 10 digit templates.
  * The image contains digits in order: 1 2 3 4 5 6 7 8 9 0.
+ * Also loads synthesized or image-based templates for '$' and ','.
  */
 async function loadReferenceTemplates() {
   console.log(`[Templates] Loading reference image: ${CFG.REF_IMAGE}`);
@@ -651,6 +726,8 @@ async function loadReferenceTemplates() {
   /* Build bank */
   const bank = {};
   for (let d = 0; d <= 9; d++) bank[d] = [];
+  bank['$'] = [];
+  bank[','] = [];
 
   for (let i = 0; i < 10; i++) {
     const seg = segs[i];
@@ -688,7 +765,33 @@ async function loadReferenceTemplates() {
     throw new Error(`Missing templates for digits: ${missing.join(', ')}`);
   }
 
-  console.log(`[Templates] Bank loaded: 10 digits, 1 reference template each`);
+  /* Load exact dollar references */
+  try {
+    const t1 = await loadTemplateFromImage('dollar-ref1.png', 4);
+    bank['$'].push(t1);
+    console.log('[Templates] Loaded dollar-ref1.png');
+  } catch (err) {
+    console.warn('[Templates] Error loading dollar-ref1.png, using fallback:', err);
+    bank['$'].push(createSynthesizedTemplate('$'));
+  }
+
+  try {
+    const t2 = await loadTemplateFromImage('dollar-ref2.png', 4);
+    bank['$'].push(t2);
+    console.log('[Templates] Loaded dollar-ref2.png');
+  } catch (err) {
+    console.warn('[Templates] Error loading dollar-ref2.png:', err);
+  }
+
+  /* Load synthesized comma */
+  try {
+    bank[','].push(createSynthesizedTemplate(','));
+    console.log('[Templates] Loaded synthesized comma template');
+  } catch (err) {
+    console.error('[Templates] Error synthesizing comma:', err);
+  }
+
+  console.log(`[Templates] Bank loaded: 10 digits + '$' and ',' templates`);
   return bank;
 }
 
@@ -734,8 +837,8 @@ function accumulateTemplate(bank, digit, grayscale, binary, features, score) {
 /** Shallow-clone the template bank (shares arrays, allows independent accumulation). */
 function cloneBank(bank) {
   const clone = {};
-  for (let d = 0; d <= 9; d++) {
-    clone[d] = bank[d].map(t => ({ ...t }));
+  for (const key of Object.keys(bank)) {
+    clone[key] = bank[key].map(t => ({ ...t }));
   }
   return clone;
 }
@@ -1083,8 +1186,9 @@ function classifyGlyph(glyph, bank) {
   const { NORM_W: W, NORM_H: H } = CFG;
   const candHoles = glyph.features.holeCount;
 
-  for (let d = 0; d <= 9; d++) {
+  for (const d of Object.keys(bank)) {
     let bestCombined = -Infinity, bestNCC_val = -Infinity, bestStruct = 0;
+    const dNum = parseInt(d, 10);
 
     for (const tmpl of bank[d]) {
       /* Shifted NCC: try original + ±1px offsets, take best */
@@ -1110,20 +1214,20 @@ function classifyGlyph(glyph, bank) {
       /* Vertical density balance bias for 8/9 discrimination.
        * 8 is vertically balanced (upper/lower ratio ~0.8–1.2).
        * 9 is top-heavy (ratio > 1.2). Apply a small bias accordingly. */
-      if (d === 8 || d === 9) {
+      if (!isNaN(dNum) && (dNum === 8 || dNum === 9)) {
         const ud = glyph.features.upperDensity;
         const ld = glyph.features.lowerDensity;
         const balance = ld > 0.001 ? ud / ld : 10;
-        if (d === 8 && balance > 1.2) {
+        if (dNum === 8 && balance > 1.2) {
           /* Glyph is top-heavy: penalize 8 (which should be balanced) */
           combined -= 0.01;
-        } else if (d === 9 && balance > 1.2) {
+        } else if (dNum === 9 && balance > 1.2) {
           /* Glyph is top-heavy: boost 9 (which is top-heavy) */
           combined += 0.01;
-        } else if (d === 9 && balance <= 1.2) {
+        } else if (dNum === 9 && balance <= 1.2) {
           /* Glyph is balanced: penalize 9 (which should be top-heavy) */
           combined -= 0.01;
-        } else if (d === 8 && balance <= 1.2) {
+        } else if (dNum === 8 && balance <= 1.2) {
           /* Glyph is balanced: boost 8 (which should be balanced) */
           combined += 0.01;
         }
@@ -1136,7 +1240,8 @@ function classifyGlyph(glyph, bank) {
       }
     }
 
-    results.push({ d, combined: bestCombined, ncc: bestNCC_val, structural: bestStruct });
+    const parsedD = isNaN(dNum) ? d : dNum;
+    results.push({ d: parsedD, combined: bestCombined, ncc: bestNCC_val, structural: bestStruct });
   }
 
   results.sort((a, b) => b.combined - a.combined);
@@ -1182,7 +1287,8 @@ function isAmbiguous(result) {
       const candHoles = result.features.holeCount;
       const topExpected = CANONICAL_HOLES[result.top3[0].d];
       const secExpected = CANONICAL_HOLES[result.top3[1].d];
-      if (topExpected !== secExpected &&
+      if (topExpected !== undefined && secExpected !== undefined &&
+          topExpected !== secExpected &&
           candHoles === topExpected && candHoles !== secExpected) {
         effectiveMargin = CFG.MIN_MARGIN;
       }
@@ -1565,6 +1671,261 @@ function recognizeRows(rows, bin, grayCanvas, bank, tag) {
   return { accepted, rowResults, allGlyphs };
 }
 
+/**
+ * Split character segments that are too wide (merged) at vertical projection minimums.
+ */
+function splitWideSegments(segs, vP, minW) {
+  const maxW = 35; // Maximum width for a single character segment
+  const result = [];
+  
+  for (const seg of segs) {
+    if (seg.w >= maxW) {
+      // Find the best split point in the middle 50% of the segment
+      const lo = seg.x + Math.floor(seg.w * 0.25);
+      const hi = seg.x + Math.floor(seg.w * 0.75);
+      let minVal = Infinity, minPos = -1;
+      
+      for (let x = lo; x <= hi; x++) {
+        if (vP[x] < minVal) {
+          minVal = vP[x];
+          minPos = x;
+        }
+      }
+      
+      if (minPos > 0) {
+        const left = { x: seg.x, w: minPos - seg.x };
+        const right = { x: minPos, w: seg.x + seg.w - minPos };
+        
+        if (left.w >= minW && right.w >= minW) {
+          // Recursively split the children in case there are 3 merged characters
+          const leftSplit = splitWideSegments([left], vP, minW);
+          const rightSplit = splitWideSegments([right], vP, minW);
+          result.push(...leftSplit, ...rightSplit);
+          continue;
+        }
+      }
+    }
+    result.push(seg);
+  }
+  return result;
+}
+
+/**
+ * Process all row bands for the price pipeline: segment → classify → validate → accept/reject.
+ */
+function recognizePriceRows(rows, bin, grayCanvas, bank, tag) {
+  const W = grayCanvas.width;
+  const minDW = Math.max(4, Math.floor(CFG.MIN_DIGIT_W_SRC * CFG.UPSCALE / 2));
+  const minDH = Math.max(4, Math.floor(CFG.MIN_DIGIT_H_SRC * CFG.UPSCALE / 2));
+
+  const accepted = [];
+  const rowResults = [];
+  const allGlyphs = [];
+
+  for (let ri = 0; ri < rows.length; ri++) {
+    const row = rows[ri];
+    const vP = vProjection(bin, W, row.y, row.h);
+    let segs = findSegmentsRaw(vP, minDW);
+    segs = splitWideSegments(segs, vP, minDW);
+
+    // Stop at space character gap (e.g. space before suffix)
+    let priceEndSegIdx = segs.length - 1;
+    for (let di = 0; di < segs.length - 1; di++) {
+      const gap = segs[di + 1].x - (segs[di].x + segs[di].w);
+      if (gap >= 15) { // 3.75 source pixels space gap (safe spacing before suffix)
+        priceEndSegIdx = di;
+        break;
+      }
+    }
+    const finalSegs = segs.slice(0, priceEndSegIdx + 1);
+
+    const rr = {
+      row, segments: finalSegs, segMethod: 'raw-projection',
+      digits: [], result: null, status: null,
+    };
+
+    if (finalSegs.length === 0) {
+      rr.status = 'rejected-empty';
+      rowResults.push(rr);
+      continue;
+    }
+
+    let firstDigitIdx = -1;
+    let lastDigitIdx = -1;
+    const classifiedSegs = [];
+
+    for (let di = 0; di < finalSegs.length; di++) {
+      const seg = finalSegs[di];
+      const bb = tightBBox(bin, W, seg.x, row.y, seg.w, row.h);
+
+      if (!bb || bb.w < 2 || bb.h < minDH) {
+        classifiedSegs.push({
+          segBounds: seg, tightBounds: bb, glyphCanvas: null,
+          classification: null, status: 'rejected', rejectReason: 'invalid-bounds',
+        });
+        continue;
+      }
+
+      const glyph = normalizeGlyph(grayCanvas, bb.x, bb.y, bb.w, bb.h);
+      glyph.features = computeStructuralFeatures(glyph.binary, CFG.NORM_W, CFG.NORM_H, glyph.grayscale);
+      const cls = classifyGlyph(glyph, bank);
+      const ambiguity = isAmbiguous(cls);
+
+      classifiedSegs.push({
+        segBounds: { x: seg.x, w: seg.w },
+        tightBounds: bb,
+        glyphCanvas: glyph.canvas,
+        classification: cls,
+        status: ambiguity ? 'ambiguous' : 'accepted',
+        rejectReason: ambiguity,
+      });
+
+      if (!ambiguity) {
+        const char = String(cls.digit);
+        if (char !== '$' && char !== ',') {
+          if (firstDigitIdx === -1) firstDigitIdx = di;
+          lastDigitIdx = di;
+        }
+      }
+    }
+
+    // Validation
+    let isValid = true;
+    let rejectReason = '';
+
+    if (firstDigitIdx === -1) {
+      isValid = false;
+      rejectReason = 'no-digits';
+    } else {
+      // All segments from firstDigitIdx to lastDigitIdx must be accepted digits or commas
+      for (let di = firstDigitIdx; di <= lastDigitIdx; di++) {
+        const cs = classifiedSegs[di];
+        if (cs.status !== 'accepted') {
+          isValid = false;
+          rejectReason = `invalid-middle-segment-${di}`;
+          break;
+        }
+        const char = String(cs.classification.digit);
+        if (char === '$') {
+          isValid = false;
+          rejectReason = `dollar-in-middle-segment-${di}`;
+          break;
+        }
+      }
+
+      // Check if there is a dollar sign before the first digit
+      if (isValid) {
+        let dollarFound = false;
+        for (let di = 0; di < firstDigitIdx; di++) {
+          const cs = classifiedSegs[di];
+          if (cs.status === 'accepted' && cs.classification.digit === '$') {
+            dollarFound = true;
+            break;
+          }
+        }
+        if (!dollarFound) {
+          isValid = false;
+          rejectReason = 'no-leading-dollar';
+        }
+      }
+    }
+
+    if (!isValid) {
+      rr.status = rejectReason;
+      rr.digits = classifiedSegs;
+      console.log(`[${tag}] Row ${ri} y=${row.y} h=${row.h} → REJECTED: ${rejectReason}`);
+      rowResults.push(rr);
+      continue;
+    }
+
+    // Build the final number string
+    let priceStr = '';
+    for (let di = firstDigitIdx; di <= lastDigitIdx; di++) {
+      const cs = classifiedSegs[di];
+      const char = String(cs.classification.digit);
+      if (char !== ',') {
+        priceStr += char;
+      }
+    }
+
+    rr.result = priceStr;
+    rr.digits = classifiedSegs;
+
+    // Validate length of digits (e.g. $572,000 has 6 digits, $1,050,000 has 7 digits)
+    if (priceStr.length < 3 || priceStr.length > 9) {
+      rr.status = 'rejected-format';
+      console.log(`[${tag}] Row ${ri} y=${row.y} h=${row.h} → REJECTED: length ${priceStr.length}`);
+      rowResults.push(rr);
+      continue;
+    }
+
+    // Check confidence of the digits
+    const digitCS = classifiedSegs.slice(firstDigitIdx, lastDigitIdx + 1).filter(cs => cs.classification.digit !== ',');
+    const minDigitScore = Math.min(...digitCS.map(cs => cs.classification.score));
+    if (minDigitScore < CFG.MIN_DIGIT_SCORE) {
+      rr.status = 'rejected-low-confidence';
+      console.log(`[${tag}] Row ${ri} y=${row.y} h=${row.h} → REJECTED: min score ${minDigitScore.toFixed(2)} < ${CFG.MIN_DIGIT_SCORE}`);
+      rowResults.push(rr);
+      continue;
+    }
+
+    console.log(`[${tag}] Row ${ri}: ${priceStr} (accepted)`);
+    const priceVal = parseInt(priceStr, 10);
+    accepted.push(priceVal);
+    rr.status = 'accepted';
+    rowResults.push(rr);
+
+    // Collect glyph details for potential bank refinement (only digits 0-9)
+    for (let di = firstDigitIdx; di <= lastDigitIdx; di++) {
+      const cs = classifiedSegs[di];
+      const char = cs.classification.digit;
+      if (char !== ',' && char !== '$') {
+        const bb = cs.tightBounds;
+        const glyph = normalizeGlyph(grayCanvas, bb.x, bb.y, bb.w, bb.h);
+        allGlyphs.push({
+          digit: char,
+          grayscale: glyph.grayscale,
+          binary: glyph.binary,
+          features: cs.classification.features,
+          score: cs.classification.score,
+        margin: cs.classification.margin,
+        });
+      }
+    }
+  }
+
+  return { accepted, rowResults, allGlyphs };
+}
+
+/** Calculate the median of an array of numbers. */
+function calculateMedian(arr) {
+  if (arr.length === 0) return 0;
+  const sorted = arr.slice().sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 !== 0) {
+    return sorted[mid];
+  }
+  return Math.round((sorted[mid - 1] + sorted[mid]) / 2);
+}
+
+/** Format an integer as a currency string. */
+function formatPrice(val) {
+  return '$' + val.toLocaleString('en-US');
+}
+
+/** Update count badge label and count number dynamically. */
+function updateCountBadge(count, isPrice) {
+  const numEl = document.getElementById('count-number');
+  if (numEl) numEl.textContent = count;
+  
+  const textNode = Array.from(countBadge.childNodes).find(n => n.nodeType === Node.TEXT_NODE && n.textContent.includes('found'));
+  if (textNode) {
+    textNode.textContent = isPrice ? ' prices found' : ' MLS numbers found';
+  } else {
+    countBadge.innerHTML = `<span>🔢</span> <span id="count-number">${count}</span> ${isPrice ? 'prices' : 'MLS numbers'} found`;
+  }
+}
+
 /** Main extraction pipeline with performance instrumentation. */
 async function runExtraction() {
   if (!currentImageBlob) return;
@@ -1627,125 +1988,243 @@ async function runExtraction() {
     perf.segmentation = Perf.end('segmentation');
     updateProgress(25);
 
-    /* --- Pass 1: reference templates --- */
-    Perf.start('classification_p1');
-    showStatus('Recognizing digits (pass 1)…', 'info');
-    await new Promise(r => setTimeout(r, 0));
+    /* --- Price Pipeline Detection --- */
+    let isPricePipeline = false;
+    let dollarMatches = 0;
+    const testRows = rows.slice(0, Math.min(5, rows.length));
+    const minDW_price = Math.max(4, Math.floor(CFG.MIN_DIGIT_W_SRC * CFG.UPSCALE / 2));
+    const minDH_price = Math.max(4, Math.floor(CFG.MIN_DIGIT_H_SRC * CFG.UPSCALE / 2));
 
-    const p1 = recognizeRows(rows, bin, grayCanvas, bank, 'P1');
-    console.log(`[P1] Accepted ${p1.accepted.length}: ${p1.accepted.join(', ')}`);
-    perf.classification_p1 = Perf.end('classification_p1');
-    updateProgress(50);
+    for (const row of testRows) {
+      const vP = vProjection(bin, up.width, row.y, row.h);
+      let segs = findSegmentsRaw(vP, minDW_price);
+      segs = splitWideSegments(segs, vP, minDW_price);
+      if (segs.length === 0) continue;
 
-    /* --- Enhance bank with high-confidence P1 glyphs --- */
-    Perf.start('bank_refinement');
-    const enhanced = cloneBank(bank);
-    let added = 0;
-    for (const g of p1.allGlyphs) {
-      if (g.score >= CFG.REFINE_SCORE && g.margin >= CFG.REFINE_MARGIN) {
-        if (accumulateTemplate(enhanced, g.digit, g.grayscale, g.binary, g.features, g.score)) {
-          added++;
-        }
+      const firstSeg = segs[0];
+      const bb = tightBBox(bin, up.width, firstSeg.x, row.y, firstSeg.w, row.h);
+      if (!bb || bb.w < 2 || bb.h < minDH_price) continue;
+
+      const glyph = normalizeGlyph(grayCanvas, bb.x, bb.y, bb.w, bb.h);
+      glyph.features = computeStructuralFeatures(glyph.binary, CFG.NORM_W, CFG.NORM_H, glyph.grayscale);
+      const cls = classifyGlyph(glyph, bank);
+
+      console.log(`[Detect] row y=${row.y} firstSeg x=${firstSeg.x} w=${firstSeg.w} bb=${bb.w}x${bb.h} → top=${cls.digit} score=${cls.score.toFixed(3)} margin=${cls.margin.toFixed(3)}`);
+      console.log(`  Candidates: ${cls.top3.map(c => `${c.d}:${c.combined.toFixed(3)}`).join(', ')}`);
+      // Also print specific score for '$' if not in top3
+      const dollarScore = cls.allScores.find(s => s.d === '$');
+      if (dollarScore) {
+        console.log(`  Dollar Score: ${dollarScore.combined.toFixed(3)} (ncc: ${dollarScore.ncc.toFixed(3)}, struct: ${dollarScore.structural.toFixed(3)})`);
       }
-    }
-    console.log(`[Refine] Added ${added} high-confidence glyphs to enhanced bank`);
-    perf.bank_refinement = Perf.end('bank_refinement');
 
-    /* --- Pass 2: enhanced bank --- */
-    Perf.start('classification_p2');
-    showStatus('Recognizing digits (pass 2)…', 'info');
-    await new Promise(r => setTimeout(r, 0));
-
-    const p2 = recognizeRows(rows, bin, grayCanvas, enhanced, 'P2');
-    console.log(`[P2] Accepted ${p2.accepted.length}: ${p2.accepted.join(', ')}`);
-    perf.classification_p2 = Perf.end('classification_p2');
-    updateProgress(85);
-
-    /* --- Conservative P1/P2 merge ---
-     * P1 accepted results are NEVER overridden.
-     * P2 may ADD numbers from rows that P1 rejected, but only if P2
-     * accepted them with all digits having margin ≥ CONFUSABLE_MARGIN. */
-    const p1Set = new Set(p1.accepted);
-    const mergedResults = [...p1.accepted];
-    const mergedRowResults = p1.rowResults.map(rr => ({ ...rr }));
-    let p2Additions = 0;
-
-    for (let i = 0; i < p2.rowResults.length; i++) {
-      const p2rr = p2.rowResults[i];
-      const p1rr = p1.rowResults[i];
-      const p1Acc = p1rr.status === 'accepted' || p1rr.status === 'accepted-pass2';
-      const p2Acc = p2rr.status === 'accepted' || p2rr.status === 'accepted-pass2';
-
-      if (!p1Acc && p2Acc && p2rr.result && /^\d{8}$/.test(p2rr.result)) {
-        const allConfident = p2rr.digits.every(dd =>
-          dd.classification && dd.classification.margin >= CFG.CONFUSABLE_MARGIN
-        );
-        if (allConfident && !p1Set.has(p2rr.result)) {
-          mergedResults.push(p2rr.result);
-          p1Set.add(p2rr.result);
-          mergedRowResults[i] = { ...p2rr, status: 'accepted-pass2' };
-          p2Additions++;
-          console.log(`[Merge] P2 recovered row ${i}: ${p2rr.result}`);
-        }
+      if (cls.digit === '$' && cls.score >= 0.50) {
+        dollarMatches++;
       }
     }
 
-    const results = mergedResults;
-    const finalRowResults = mergedRowResults;
-    console.log(`[Result] P1: ${p1.accepted.length}, P2 additions: ${p2Additions}, total: ${results.length}`);
+    if (dollarMatches >= Math.max(1, Math.min(2, testRows.length))) {
+      isPricePipeline = true;
+    }
+    console.log(`[Pipeline Detection] Dollar sign matches: ${dollarMatches}/${testRows.length} → isPricePipeline = ${isPricePipeline}`);
 
-    /* --- Accumulate to persistent bank (for next extraction) --- */
-    const glyphsForBank = p1.allGlyphs;
-    let persisted = 0;
-    for (const g of glyphsForBank) {
-      if (g.score >= CFG.REFINE_SCORE && g.margin >= CFG.REFINE_MARGIN) {
-        if (accumulateTemplate(bank, g.digit, g.grayscale, g.binary, g.features, g.score)) {
-          persisted++;
+    if (isPricePipeline) {
+      /* --- Price Pipeline --- */
+      Perf.start('classification_price');
+      showStatus('Recognizing prices…', 'info');
+      await new Promise(r => setTimeout(r, 0));
+
+      const priceResult = recognizePriceRows(rows, bin, grayCanvas, bank, 'Price');
+      console.log(`[Price] Accepted ${priceResult.accepted.length} prices: ${priceResult.accepted.join(', ')}`);
+      perf.classification_p1 = Perf.end('classification_price');
+      updateProgress(85);
+
+      const results = priceResult.accepted;
+      const finalRowResults = priceResult.rowResults;
+
+      /* --- Accumulate to persistent bank (for next extraction) --- */
+      const glyphsForBank = priceResult.allGlyphs;
+      let persisted = 0;
+      for (const g of glyphsForBank) {
+        if (g.score >= CFG.REFINE_SCORE && g.margin >= CFG.REFINE_MARGIN) {
+          if (accumulateTemplate(bank, g.digit, g.grayscale, g.binary, g.features, g.score)) {
+            persisted++;
+          }
         }
       }
-    }
-    if (persisted > 0) {
-      const counts = {};
-      for (let d = 0; d <= 9; d++) counts[d] = bank[d].length;
-      console.log(`[Bank] Persisted ${persisted} templates. Bank sizes:`, counts);
-    }
+      if (persisted > 0) {
+        const counts = {};
+        for (let d = 0; d <= 9; d++) counts[d] = bank[d].length;
+        console.log(`[Bank] Persisted ${persisted} templates. Bank sizes:`, counts);
+      }
 
-    perf.total = Perf.end('total');
-    updateProgress(100);
-    console.log(`==========================================\n`);
+      perf.total = Perf.end('total');
+      updateProgress(100);
+      console.log(`==========================================\n`);
 
-    /* --- Display results --- */
-    if (!results.length) {
-      showStatus('No valid 8-digit MLS numbers detected.', 'error');
+      if (!results.length) {
+        showStatus('No valid prices detected.', 'error');
+        progressWrap.classList.add('hidden');
+
+        /* Still render debug even on failure */
+        if (debugCard) {
+          Perf.start('debug_render');
+          renderDebugOverlay(grayCanvas, finalRowResults);
+          renderDebugTable(finalRowResults, perf);
+          debugCard.classList.remove('hidden');
+          Perf.end('debug_render');
+        }
+        return;
+      }
+
+      // Calculate median
+      const median = calculateMedian(results);
+      const formattedMedian = formatPrice(median);
+      const formattedList = results.map(formatPrice).join(', ');
+
+      outputBox.value = `Extracted Prices: ${formattedList}\nMedian Price: ${formattedMedian}`;
+      valueToCopy = formattedMedian;
+
+      resultCard.classList.remove('hidden');
+      updateCountBadge(results.length, true);
+      countBadge.classList.remove('hidden');
+      copyBtn.disabled = false;
       progressWrap.classList.add('hidden');
+      await copyToClipboard(valueToCopy);
+      showStatus(`Extraction complete — Median price ${formattedMedian} copied to clipboard.`, 'success');
 
-      /* Still render debug even on failure */
+      /* --- Debug rendering --- */
       if (debugCard) {
         Perf.start('debug_render');
         renderDebugOverlay(grayCanvas, finalRowResults);
         renderDebugTable(finalRowResults, perf);
         debugCard.classList.remove('hidden');
-        Perf.end('debug_render');
+        perf.debug_render = Perf.end('debug_render');
       }
-      return;
-    }
 
-    outputBox.value = results.join(', ');
-    resultCard.classList.remove('hidden');
-    countNumber.textContent = results.length;
-    countBadge.classList.remove('hidden');
-    copyBtn.disabled = false;
-    progressWrap.classList.add('hidden');
-    await copyToClipboard(outputBox.value);
-    showStatus(`Extraction complete — ${results.length} numbers copied to clipboard.`, 'success');
+    } else {
+      /* --- Original MLS# Pipeline --- */
+      /* --- Pass 1: reference templates --- */
+      Perf.start('classification_p1');
+      showStatus('Recognizing digits (pass 1)…', 'info');
+      await new Promise(r => setTimeout(r, 0));
 
-    /* --- Debug rendering (completely decoupled from classification) --- */
-    if (debugCard) {
-      Perf.start('debug_render');
-      renderDebugOverlay(grayCanvas, finalRowResults);
-      renderDebugTable(finalRowResults, perf);
-      debugCard.classList.remove('hidden');
-      perf.debug_render = Perf.end('debug_render');
+      const p1 = recognizeRows(rows, bin, grayCanvas, bank, 'P1');
+      console.log(`[P1] Accepted ${p1.accepted.length}: ${p1.accepted.join(', ')}`);
+      perf.classification_p1 = Perf.end('classification_p1');
+      updateProgress(50);
+
+      /* --- Enhance bank with high-confidence P1 glyphs --- */
+      Perf.start('bank_refinement');
+      const enhanced = cloneBank(bank);
+      let added = 0;
+      for (const g of p1.allGlyphs) {
+        if (g.score >= CFG.REFINE_SCORE && g.margin >= CFG.REFINE_MARGIN) {
+          if (accumulateTemplate(enhanced, g.digit, g.grayscale, g.binary, g.features, g.score)) {
+            added++;
+          }
+        }
+      }
+      console.log(`[Refine] Added ${added} high-confidence glyphs to enhanced bank`);
+      perf.bank_refinement = Perf.end('bank_refinement');
+
+      /* --- Pass 2: enhanced bank --- */
+      Perf.start('classification_p2');
+      showStatus('Recognizing digits (pass 2)…', 'info');
+      await new Promise(r => setTimeout(r, 0));
+
+      const p2 = recognizeRows(rows, bin, grayCanvas, enhanced, 'P2');
+      console.log(`[P2] Accepted ${p2.accepted.length}: ${p2.accepted.join(', ')}`);
+      perf.classification_p2 = Perf.end('classification_p2');
+      updateProgress(85);
+
+      /* --- Conservative P1/P2 merge ---
+       * P1 accepted results are NEVER overridden.
+       * P2 may ADD numbers from rows that P1 rejected, but only if P2
+       * accepted them with all digits having margin ≥ CONFUSABLE_MARGIN. */
+      const p1Set = new Set(p1.accepted);
+      const mergedResults = [...p1.accepted];
+      const mergedRowResults = p1.rowResults.map(rr => ({ ...rr }));
+      let p2Additions = 0;
+
+      for (let i = 0; i < p2.rowResults.length; i++) {
+        const p2rr = p2.rowResults[i];
+        const p1rr = p1.rowResults[i];
+        const p1Acc = p1rr.status === 'accepted' || p1rr.status === 'accepted-pass2';
+        const p2Acc = p2rr.status === 'accepted' || p2rr.status === 'accepted-pass2';
+
+        if (!p1Acc && p2Acc && p2rr.result && /^\d{8}$/.test(p2rr.result)) {
+          const allConfident = p2rr.digits.every(dd =>
+            dd.classification && dd.classification.margin >= CFG.CONFUSABLE_MARGIN
+          );
+          if (allConfident && !p1Set.has(p2rr.result)) {
+            mergedResults.push(p2rr.result);
+            p1Set.add(p2rr.result);
+            mergedRowResults[i] = { ...p2rr, status: 'accepted-pass2' };
+            p2Additions++;
+            console.log(`[Merge] P2 recovered row ${i}: ${p2rr.result}`);
+          }
+        }
+      }
+
+      const results = mergedResults;
+      const finalRowResults = mergedRowResults;
+      console.log(`[Result] P1: ${p1.accepted.length}, P2 additions: ${p2Additions}, total: ${results.length}`);
+
+      /* --- Accumulate to persistent bank (for next extraction) --- */
+      const glyphsForBank = p1.allGlyphs;
+      let persisted = 0;
+      for (const g of glyphsForBank) {
+        if (g.score >= CFG.REFINE_SCORE && g.margin >= CFG.REFINE_MARGIN) {
+          if (accumulateTemplate(bank, g.digit, g.grayscale, g.binary, g.features, g.score)) {
+            persisted++;
+          }
+        }
+      }
+      if (persisted > 0) {
+        const counts = {};
+        for (let d = 0; d <= 9; d++) counts[d] = bank[d].length;
+        console.log(`[Bank] Persisted ${persisted} templates. Bank sizes:`, counts);
+      }
+
+      perf.total = Perf.end('total');
+      updateProgress(100);
+      console.log(`==========================================\n`);
+
+      /* --- Display results --- */
+      if (!results.length) {
+        showStatus('No valid 8-digit MLS numbers detected.', 'error');
+        progressWrap.classList.add('hidden');
+
+        /* Still render debug even on failure */
+        if (debugCard) {
+          Perf.start('debug_render');
+          renderDebugOverlay(grayCanvas, finalRowResults);
+          renderDebugTable(finalRowResults, perf);
+          debugCard.classList.remove('hidden');
+          Perf.end('debug_render');
+        }
+        return;
+      }
+
+      outputBox.value = results.join(', ');
+      valueToCopy = outputBox.value;
+
+      resultCard.classList.remove('hidden');
+      updateCountBadge(results.length, false);
+      countBadge.classList.remove('hidden');
+      copyBtn.disabled = false;
+      progressWrap.classList.add('hidden');
+      await copyToClipboard(valueToCopy);
+      showStatus(`Extraction complete — ${results.length} numbers copied to clipboard.`, 'success');
+
+      /* --- Debug rendering (completely decoupled from classification) --- */
+      if (debugCard) {
+        Perf.start('debug_render');
+        renderDebugOverlay(grayCanvas, finalRowResults);
+        renderDebugTable(finalRowResults, perf);
+        debugCard.classList.remove('hidden');
+        perf.debug_render = Perf.end('debug_render');
+      }
     }
 
   } catch (err) {
@@ -1759,8 +2238,6 @@ async function runExtraction() {
 
 /* ================================================================== */
 /*  SECTION 11 — CLIPBOARD, STATUS, PERFORMANCE                       */
-/* ================================================================== */
-
 /* --- Performance instrumentation --- */
 const Perf = {
   _timers: {},
@@ -1775,7 +2252,7 @@ const Perf = {
 
 /* --- Clipboard --- */
 copyBtn.addEventListener('click', async () => {
-  const text = outputBox.value;
+  const text = valueToCopy || outputBox.value;
   if (!text) return;
   await copyToClipboard(text);
 });
