@@ -1739,12 +1739,21 @@ function recognizePriceRows(rows, bin, grayCanvas, bank, tag) {
     }
     const finalSegs = segs.slice(0, priceEndSegIdx + 1);
 
+    // Disregard commas / small noise based on vertical height
+    const digitSegs = [];
+    for (const seg of finalSegs) {
+      const bb = tightBBox(bin, W, seg.x, row.y, seg.w, row.h);
+      if (bb && bb.h >= row.h * 0.50) {
+        digitSegs.push(seg);
+      }
+    }
+
     const rr = {
-      row, segments: finalSegs, segMethod: 'raw-projection',
+      row, segments: digitSegs, segMethod: 'raw-projection',
       digits: [], result: null, status: null,
     };
 
-    if (finalSegs.length === 0) {
+    if (digitSegs.length === 0) {
       rr.status = 'rejected-empty';
       rowResults.push(rr);
       continue;
@@ -1754,8 +1763,8 @@ function recognizePriceRows(rows, bin, grayCanvas, bank, tag) {
     let lastDigitIdx = -1;
     const classifiedSegs = [];
 
-    for (let di = 0; di < finalSegs.length; di++) {
-      const seg = finalSegs[di];
+    for (let di = 0; di < digitSegs.length; di++) {
+      const seg = digitSegs[di];
       const bb = tightBBox(bin, W, seg.x, row.y, seg.w, row.h);
 
       if (!bb || bb.w < 2 || bb.h < minDH) {
