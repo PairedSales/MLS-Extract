@@ -727,7 +727,6 @@ async function loadReferenceTemplates() {
   const bank = {};
   for (let d = 0; d <= 9; d++) bank[d] = [];
   bank['$'] = [];
-  bank[','] = [];
 
   for (let i = 0; i < 10; i++) {
     const seg = segs[i];
@@ -783,15 +782,15 @@ async function loadReferenceTemplates() {
     console.warn('[Templates] Error loading dollar-ref2.png:', err);
   }
 
-  /* Load synthesized comma */
+  /* Load synthesized S template into dollar bucket to handle cases where vertical line is lost during binarization */
   try {
-    bank[','].push(createSynthesizedTemplate(','));
-    console.log('[Templates] Loaded synthesized comma template');
+    bank['$'].push(createSynthesizedTemplate('S'));
+    console.log('[Templates] Loaded synthesized S template into dollar bucket');
   } catch (err) {
-    console.error('[Templates] Error synthesizing comma:', err);
+    console.warn('[Templates] Error synthesizing S template:', err);
   }
 
-  console.log(`[Templates] Bank loaded: 10 digits + '$' and ',' templates`);
+  console.log(`[Templates] Bank loaded: 10 digits + '$' templates`);
   return bank;
 }
 
