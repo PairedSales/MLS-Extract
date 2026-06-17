@@ -375,9 +375,12 @@ function splitWidest(segs, vP, minW, target) {
     const seg = segs[maxIdx];
     const lo = seg.x + Math.floor(seg.w * 0.25);
     const hi = seg.x + Math.floor(seg.w * 0.75);
+    const center = seg.x + seg.w / 2;
     let minVal = Infinity, minPos = -1;
     for (let x = lo; x <= hi; x++) {
-      if (vP[x] < minVal) { minVal = vP[x]; minPos = x; }
+      const dist = Math.abs(x - center);
+      const val = vP[x] + dist * 1.5;
+      if (val < minVal) { minVal = val; minPos = x; }
     }
     if (minPos < 0) break;
     const left  = { x: seg.x, w: minPos - seg.x };
@@ -1682,11 +1685,14 @@ function splitWideSegments(segs, vP, minW) {
       // Find the best split point in the middle 50% of the segment
       const lo = seg.x + Math.floor(seg.w * 0.25);
       const hi = seg.x + Math.floor(seg.w * 0.75);
+      const center = seg.x + seg.w / 2;
       let minVal = Infinity, minPos = -1;
       
       for (let x = lo; x <= hi; x++) {
-        if (vP[x] < minVal) {
-          minVal = vP[x];
+        const dist = Math.abs(x - center);
+        const val = vP[x] + dist * 1.5;
+        if (val < minVal) {
+          minVal = val;
           minPos = x;
         }
       }
