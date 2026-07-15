@@ -363,32 +363,78 @@ function mergeClosest(segs, target) {
   return segs;
 }
 
-/** Split the widest segment at its projection minimum until we reach the target count. */
+/**
+ * Split segments to reach the target count.
+ * Digits are allocated to segments proportionally to width (largest-remainder),
+ * then each multi-digit segment is split at projection minima near the expected
+ * uniform boundaries. A pure center-biased split fails on 3+ merged digits
+ * (e.g. "443" where the 4's crossbar touches the next glyph): the true
+ * boundaries sit at 1/3 and 2/3, so a center split cuts through a glyph.
+ */
 function splitWidest(segs, vP, minW, target) {
   segs = segs.slice();
-  while (segs.length < target) {
-    let maxW = 0, maxIdx = -1;
+  if (segs.length >= target) return segs;
+
+  const totalW = segs.reduce((s, g) => s + g.w, 0);
+  if (totalW <= 0) return segs;
+
+  /* Allocate digit counts proportionally to segment width */
+  const quotas = segs.map(g => (g.w * target) / totalW);
+  const counts = quotas.map(q => Math.max(1, Math.floor(q)));
+  let assigned = counts.reduce((s, n) => s + n, 0);
+  while (assigned < target) {
+    /* Give the next digit to the segment furthest below its quota */
+    let best = -1, bestDeficit = -Infinity;
     for (let i = 0; i < segs.length; i++) {
-      if (segs[i].w > maxW) { maxW = segs[i].w; maxIdx = i; }
+      const deficit = quotas[i] - counts[i];
+      if (deficit > bestDeficit) { bestDeficit = deficit; best = i; }
     }
-    if (maxIdx < 0 || maxW < minW * 2) break;
-    const seg = segs[maxIdx];
-    const lo = seg.x + Math.floor(seg.w * 0.25);
-    const hi = seg.x + Math.floor(seg.w * 0.75);
-    const center = seg.x + seg.w / 2;
+    counts[best]++;
+    assigned++;
+  }
+  while (assigned > target) {
+    /* Take back from the segment furthest above its quota (keep ≥ 1 each) */
+    let best = -1, bestExcess = -Infinity;
+    for (let i = 0; i < segs.length; i++) {
+      if (counts[i] <= 1) continue;
+      const excess = counts[i] - quotas[i];
+      if (excess > bestExcess) { bestExcess = excess; best = i; }
+    }
+    if (best < 0) break;
+    counts[best]--;
+    assigned--;
+  }
+
+  const out = [];
+  for (let i = 0; i < segs.length; i++) {
+    out.push(...splitSegmentInto(segs[i], vP, minW, counts[i]));
+  }
+  return out;
+}
+
+/** Split one segment into n parts at projection minima near uniform boundaries. */
+function splitSegmentInto(seg, vP, minW, n) {
+  if (n <= 1 || seg.w < minW * 2) return [seg];
+  const end = seg.x + seg.w;
+  const digitW = seg.w / n;
+  const parts = [];
+  let sx = seg.x;
+  for (let k = 1; k < n; k++) {
+    const expected = seg.x + digitW * k;
+    const halfWin = digitW * 0.3;
+    const lo = Math.max(sx + minW, Math.round(expected - halfWin));
+    const hi = Math.min(end - minW * (n - k), Math.round(expected + halfWin));
+    if (lo > hi) return [seg];
     let minVal = Infinity, minPos = -1;
     for (let x = lo; x <= hi; x++) {
-      const dist = Math.abs(x - center);
-      const val = vP[x] + dist * 1.5;
+      const val = vP[x] + Math.abs(x - expected) * 1.5;
       if (val < minVal) { minVal = val; minPos = x; }
     }
-    if (minPos < 0) break;
-    const left  = { x: seg.x, w: minPos - seg.x };
-    const right = { x: minPos, w: seg.x + seg.w - minPos };
-    if (left.w < minW || right.w < minW) break;
-    segs.splice(maxIdx, 1, left, right);
+    parts.push({ x: sx, w: minPos - sx });
+    sx = minPos;
   }
-  return segs;
+  parts.push({ x: sx, w: end - sx });
+  return parts.every(p => p.w >= minW) ? parts : [seg];
 }
 
 /**
@@ -1928,15 +1974,303 @@ function formatPrice(val) {
 }
 
 /** Update count badge label and count number dynamically. */
-function updateCountBadge(count, isPrice) {
+function updateCountBadge(count, noun) {
   const numEl = document.getElementById('count-number');
   if (numEl) numEl.textContent = count;
-  
+
   const textNode = Array.from(countBadge.childNodes).find(n => n.nodeType === Node.TEXT_NODE && n.textContent.includes('found'));
   if (textNode) {
-    textNode.textContent = isPrice ? ' prices found' : ' MLS numbers found';
+    textNode.textContent = ` ${noun} found`;
   } else {
-    countBadge.innerHTML = `<span>🔢</span> <span id="count-number">${count}</span> ${isPrice ? 'prices' : 'MLS numbers'} found`;
+    countBadge.innerHTML = `<span>🔢</span> <span id="count-number">${count}</span> ${noun} found`;
+  }
+}
+
+/* ================================================================== */
+/*  SECTION 10b — GENERIC MEDIAN-LIST PIPELINE (DOM, extensible)      */
+/* ================================================================== */
+
+/**
+ * Count digit-height segments in a row (used for list-type detection).
+ * Reuses the same projection + wide-split segmentation as the recognizers.
+ */
+function countDigitSegs(row, bin, W) {
+  const minDW = Math.max(4, Math.floor(CFG.MIN_DIGIT_W_SRC * CFG.UPSCALE / 2));
+  const vP = vProjection(bin, W, row.y, row.h);
+  let segs = findSegmentsRaw(vP, minDW);
+  segs = splitWideSegments(segs, vP, minDW);
+  let count = 0;
+  for (const seg of segs) {
+    const bb = tightBBox(bin, W, seg.x, row.y, seg.w, row.h);
+    if (bb && bb.h >= row.h * 0.50) count++;
+  }
+  return count;
+}
+
+/**
+ * Automatically determine which kind of list the image contains.
+ * Returns 'price' | 'mls' | 'dom'. Uses the shared recognition pipeline
+ * (dollar-glyph match + segment-count voting) — no user mode selection.
+ */
+function detectListType(rows, bin, W, grayCanvas, bank) {
+  const testRows = rows.slice(0, Math.min(5, rows.length));
+  const minDW = Math.max(4, Math.floor(CFG.MIN_DIGIT_W_SRC * CFG.UPSCALE / 2));
+  const minDH = Math.max(4, Math.floor(CFG.MIN_DIGIT_H_SRC * CFG.UPSCALE / 2));
+
+  /* 1) Sale Price: a leading '$' glyph on the sample rows. */
+  let dollarMatches = 0;
+  for (const row of testRows) {
+    const vP = vProjection(bin, W, row.y, row.h);
+    let segs = findSegmentsRaw(vP, minDW);
+    segs = splitWideSegments(segs, vP, minDW);
+    if (segs.length === 0) continue;
+
+    const firstSeg = segs[0];
+    const bb = tightBBox(bin, W, firstSeg.x, row.y, firstSeg.w, row.h);
+    if (!bb || bb.w < 2 || bb.h < minDH) continue;
+
+    const glyph = normalizeGlyph(grayCanvas, bb.x, bb.y, bb.w, bb.h);
+    glyph.features = computeStructuralFeatures(glyph.binary, CFG.NORM_W, CFG.NORM_H, glyph.grayscale);
+    const cls = classifyGlyph(glyph, bank);
+    if (cls.digit === '$' && cls.score >= 0.50) dollarMatches++;
+  }
+  if (dollarMatches >= Math.max(1, Math.min(2, testRows.length))) {
+    console.log(`[Detect] dollar matches ${dollarMatches}/${testRows.length} → price`);
+    return 'price';
+  }
+
+  /* 2) MLS (8-digit rows) vs DOM (short integers): segment-count vote. */
+  let mlsVotes = 0, shortVotes = 0;
+  for (const row of testRows) {
+    const c = countDigitSegs(row, bin, W);
+    if (c === 0) continue;
+    if (c >= 6) mlsVotes++;   /* MLS numbers are 8 digits (allow seg noise) */
+    else shortVotes++;        /* DOM values are 1–3 digits */
+  }
+  const type = (mlsVotes >= 1 && mlsVotes >= shortVotes) ? 'mls' : 'dom';
+  console.log(`[Detect] seg-count votes mls=${mlsVotes} short=${shortVotes} → ${type}`);
+  return type;
+}
+
+/**
+ * Recognize rows of plain short integers (Days on Market).
+ * Reuses the exact digit recognizer; a row is accepted only if every
+ * segment is a confident digit (headers/letters fall out via confidence).
+ * Returns { accepted, rowResults, allGlyphs }.
+ */
+function recognizeDomRows(rows, bin, grayCanvas, bank, tag) {
+  const W = grayCanvas.width;
+  const minDW = Math.max(4, Math.floor(CFG.MIN_DIGIT_W_SRC * CFG.UPSCALE / 2));
+  const minDH = Math.max(4, Math.floor(CFG.MIN_DIGIT_H_SRC * CFG.UPSCALE / 2));
+
+  const accepted = [];
+  const rowResults = [];
+  const allGlyphs = [];
+
+  for (let ri = 0; ri < rows.length; ri++) {
+    const row = rows[ri];
+    const vP = vProjection(bin, W, row.y, row.h);
+    let segs = findSegmentsRaw(vP, minDW);
+    segs = splitWideSegments(segs, vP, minDW);
+
+    /* Keep only digit-height segments (drops separators / small noise). */
+    const digitSegs = [];
+    for (const seg of segs) {
+      const bb = tightBBox(bin, W, seg.x, row.y, seg.w, row.h);
+      if (bb && bb.h >= row.h * 0.50) digitSegs.push(seg);
+    }
+
+    const rr = {
+      row, segments: digitSegs, segMethod: 'raw-projection',
+      digits: [], result: null, status: null,
+    };
+
+    if (digitSegs.length === 0) {
+      rr.status = 'rejected-empty';
+      rowResults.push(rr);
+      continue;
+    }
+
+    let numStr = '';
+    let valid = true;
+    let rejectReason = '';
+    const classified = [];
+
+    for (let di = 0; di < digitSegs.length; di++) {
+      const seg = digitSegs[di];
+      const bb = tightBBox(bin, W, seg.x, row.y, seg.w, row.h);
+
+      if (!bb || bb.w < 2 || bb.h < minDH) {
+        classified.push({
+          segBounds: seg, tightBounds: bb, glyphCanvas: null,
+          classification: null, status: 'rejected', rejectReason: 'invalid-bounds',
+        });
+        valid = false;
+        rejectReason = `invalid-bounds-${di}`;
+        break;
+      }
+
+      const glyph = normalizeGlyph(grayCanvas, bb.x, bb.y, bb.w, bb.h);
+      glyph.features = computeStructuralFeatures(glyph.binary, CFG.NORM_W, CFG.NORM_H, glyph.grayscale);
+      const cls = classifyGlyph(glyph, bank);
+      const ambiguity = isAmbiguous(cls);
+
+      classified.push({
+        segBounds: { x: seg.x, w: seg.w },
+        tightBounds: bb,
+        glyphCanvas: glyph.canvas,
+        classification: cls,
+        status: ambiguity ? 'ambiguous' : 'accepted',
+        rejectReason: ambiguity,
+      });
+
+      /* DOM values are pure digits 0–9. Anything else invalidates the row. */
+      if (ambiguity || typeof cls.digit !== 'number') {
+        valid = false;
+        rejectReason = ambiguity ? `ambiguous-${di}` : `non-digit-${di}`;
+        break;
+      }
+      numStr += String(cls.digit);
+    }
+
+    rr.digits = classified;
+
+    if (!valid || numStr.length === 0) {
+      rr.status = rejectReason || 'rejected';
+      console.log(`[${tag}] Row ${ri} y=${row.y} h=${row.h} → REJECTED: ${rr.status}`);
+      rowResults.push(rr);
+      continue;
+    }
+
+    /* Length sanity: DOM values are short integers. */
+    if (numStr.length > 6) {
+      rr.status = `rejected-length-${numStr.length}`;
+      console.log(`[${tag}] Row ${ri} y=${row.y} h=${row.h} → REJECTED: length ${numStr.length}`);
+      rowResults.push(rr);
+      continue;
+    }
+
+    /* Confidence gate — rejects header letters mis-matched to digits. */
+    const minScore = Math.min(...classified.map(cs => cs.classification.score));
+    if (minScore < CFG.MIN_DIGIT_SCORE) {
+      rr.status = 'rejected-low-confidence';
+      console.log(`[${tag}] Row ${ri} y=${row.y} h=${row.h} → REJECTED: min score ${minScore.toFixed(2)} < ${CFG.MIN_DIGIT_SCORE}`);
+      rowResults.push(rr);
+      continue;
+    }
+
+    const val = parseInt(numStr, 10);
+    rr.result = numStr;
+    rr.status = 'accepted';
+    accepted.push(val);
+    rowResults.push(rr);
+    console.log(`[${tag}] Row ${ri}: ${numStr} (accepted)`);
+
+    /* Collect glyphs for adaptive bank refinement. */
+    for (const cs of classified) {
+      const bb = cs.tightBounds;
+      const glyph = normalizeGlyph(grayCanvas, bb.x, bb.y, bb.w, bb.h);
+      allGlyphs.push({
+        digit: cs.classification.digit,
+        grayscale: glyph.grayscale,
+        binary: glyph.binary,
+        features: cs.classification.features,
+        score: cs.classification.score,
+        margin: cs.classification.margin,
+      });
+    }
+  }
+
+  return { accepted, rowResults, allGlyphs };
+}
+
+/**
+ * Display configuration per median-based list type. Adding a new list type
+ * is as simple as adding a recognizer + an entry here + a branch in detection.
+ */
+const LIST_DISPLAY = {
+  price: {
+    noun: 'prices',
+    listLabel: 'Prices',
+    medianLabel: 'Median Price',
+    emptyMessage: 'No valid prices detected.',
+    format: (v) => formatPrice(v),
+  },
+  dom: {
+    noun: 'DOM values',
+    listLabel: 'Days on Market',
+    medianLabel: 'Median Days on Market',
+    emptyMessage: 'No valid Days on Market values detected.',
+    format: (v) => String(v),
+  },
+};
+
+/**
+ * Shared finalization for median-based list types (price, DOM):
+ * accumulate templates, compute + display the median, copy to clipboard,
+ * and render debug. Keeps per-type behavior in LIST_DISPLAY for modularity.
+ */
+async function finishMedianExtraction(listType, recog, bank, grayCanvas, perf) {
+  const disp = LIST_DISPLAY[listType];
+  const results = recog.accepted;
+  const finalRowResults = recog.rowResults;
+
+  /* --- Accumulate to persistent bank (for next extraction) --- */
+  let persisted = 0;
+  for (const g of recog.allGlyphs) {
+    if (g.score >= CFG.REFINE_SCORE && g.margin >= CFG.REFINE_MARGIN) {
+      if (accumulateTemplate(bank, g.digit, g.grayscale, g.binary, g.features, g.score)) {
+        persisted++;
+      }
+    }
+  }
+  if (persisted > 0) {
+    const counts = {};
+    for (let d = 0; d <= 9; d++) counts[d] = bank[d].length;
+    console.log(`[Bank] Persisted ${persisted} templates. Bank sizes:`, counts);
+  }
+
+  perf.total = Perf.end('total');
+  updateProgress(100);
+  console.log(`==========================================\n`);
+
+  if (!results.length) {
+    showStatus(disp.emptyMessage, 'error');
+    progressWrap.classList.add('hidden');
+
+    /* Still render debug even on failure */
+    if (debugCard) {
+      Perf.start('debug_render');
+      renderDebugOverlay(grayCanvas, finalRowResults);
+      renderDebugTable(finalRowResults, perf);
+      debugCard.classList.remove('hidden');
+      Perf.end('debug_render');
+    }
+    return;
+  }
+
+  const median = calculateMedian(results);
+  const formattedMedian = disp.format(median);
+  const formattedList = results.map(disp.format).join(', ');
+
+  outputBox.value = `Extracted ${disp.listLabel}: ${formattedList}\n${disp.medianLabel}: ${formattedMedian}`;
+  valueToCopy = formattedMedian;
+
+  resultCard.classList.remove('hidden');
+  updateCountBadge(results.length, disp.noun);
+  countBadge.classList.remove('hidden');
+  copyBtn.disabled = false;
+  progressWrap.classList.add('hidden');
+  await copyToClipboard(valueToCopy);
+  showStatus(`Extraction complete — ${disp.medianLabel} ${formattedMedian} copied to clipboard.`, 'success');
+
+  /* --- Debug rendering --- */
+  if (debugCard) {
+    Perf.start('debug_render');
+    renderDebugOverlay(grayCanvas, finalRowResults);
+    renderDebugTable(finalRowResults, perf);
+    debugCard.classList.remove('hidden');
+    perf.debug_render = Perf.end('debug_render');
   }
 }
 
@@ -2002,118 +2336,28 @@ async function runExtraction() {
     perf.segmentation = Perf.end('segmentation');
     updateProgress(25);
 
-    /* --- Price Pipeline Detection --- */
-    let isPricePipeline = false;
-    let dollarMatches = 0;
-    const testRows = rows.slice(0, Math.min(5, rows.length));
-    const minDW_price = Math.max(4, Math.floor(CFG.MIN_DIGIT_W_SRC * CFG.UPSCALE / 2));
-    const minDH_price = Math.max(4, Math.floor(CFG.MIN_DIGIT_H_SRC * CFG.UPSCALE / 2));
+    /* --- List-type detection (price / mls / dom) --- */
+    Perf.start('detection');
+    showStatus('Detecting list type…', 'info');
+    const listType = detectListType(rows, bin, up.width, grayCanvas, bank);
+    console.log(`[Pipeline Detection] listType = ${listType}`);
+    perf.detection = Perf.end('detection');
+    updateProgress(30);
 
-    for (const row of testRows) {
-      const vP = vProjection(bin, up.width, row.y, row.h);
-      let segs = findSegmentsRaw(vP, minDW_price);
-      segs = splitWideSegments(segs, vP, minDW_price);
-      if (segs.length === 0) continue;
-
-      const firstSeg = segs[0];
-      const bb = tightBBox(bin, up.width, firstSeg.x, row.y, firstSeg.w, row.h);
-      if (!bb || bb.w < 2 || bb.h < minDH_price) continue;
-
-      const glyph = normalizeGlyph(grayCanvas, bb.x, bb.y, bb.w, bb.h);
-      glyph.features = computeStructuralFeatures(glyph.binary, CFG.NORM_W, CFG.NORM_H, glyph.grayscale);
-      const cls = classifyGlyph(glyph, bank);
-
-      console.log(`[Detect] row y=${row.y} firstSeg x=${firstSeg.x} w=${firstSeg.w} bb=${bb.w}x${bb.h} → top=${cls.digit} score=${cls.score.toFixed(3)} margin=${cls.margin.toFixed(3)}`);
-      console.log(`  Candidates: ${cls.top3.map(c => `${c.d}:${c.combined.toFixed(3)}`).join(', ')}`);
-      // Also print specific score for '$' if not in top3
-      const dollarScore = cls.allScores.find(s => s.d === '$');
-      if (dollarScore) {
-        console.log(`  Dollar Score: ${dollarScore.combined.toFixed(3)} (ncc: ${dollarScore.ncc.toFixed(3)}, struct: ${dollarScore.structural.toFixed(3)})`);
-      }
-
-      if (cls.digit === '$' && cls.score >= 0.50) {
-        dollarMatches++;
-      }
-    }
-
-    if (dollarMatches >= Math.max(1, Math.min(2, testRows.length))) {
-      isPricePipeline = true;
-    }
-    console.log(`[Pipeline Detection] Dollar sign matches: ${dollarMatches}/${testRows.length} → isPricePipeline = ${isPricePipeline}`);
-
-    if (isPricePipeline) {
-      /* --- Price Pipeline --- */
-      Perf.start('classification_price');
-      showStatus('Recognizing prices…', 'info');
+    if (listType === 'price' || listType === 'dom') {
+      /* --- Median-list pipeline (Sale Price, Days on Market) --- */
+      Perf.start('classification_median');
+      showStatus(listType === 'price' ? 'Recognizing prices…' : 'Recognizing days on market…', 'info');
       await new Promise(r => setTimeout(r, 0));
 
-      const priceResult = recognizePriceRows(rows, bin, grayCanvas, bank, 'Price');
-      console.log(`[Price] Accepted ${priceResult.accepted.length} prices: ${priceResult.accepted.join(', ')}`);
-      perf.classification_p1 = Perf.end('classification_price');
+      const recog = listType === 'price'
+        ? recognizePriceRows(rows, bin, grayCanvas, bank, 'Price')
+        : recognizeDomRows(rows, bin, grayCanvas, bank, 'DOM');
+      console.log(`[${listType}] Accepted ${recog.accepted.length}: ${recog.accepted.join(', ')}`);
+      perf.classification_p1 = Perf.end('classification_median');
       updateProgress(85);
 
-      const results = priceResult.accepted;
-      const finalRowResults = priceResult.rowResults;
-
-      /* --- Accumulate to persistent bank (for next extraction) --- */
-      const glyphsForBank = priceResult.allGlyphs;
-      let persisted = 0;
-      for (const g of glyphsForBank) {
-        if (g.score >= CFG.REFINE_SCORE && g.margin >= CFG.REFINE_MARGIN) {
-          if (accumulateTemplate(bank, g.digit, g.grayscale, g.binary, g.features, g.score)) {
-            persisted++;
-          }
-        }
-      }
-      if (persisted > 0) {
-        const counts = {};
-        for (let d = 0; d <= 9; d++) counts[d] = bank[d].length;
-        console.log(`[Bank] Persisted ${persisted} templates. Bank sizes:`, counts);
-      }
-
-      perf.total = Perf.end('total');
-      updateProgress(100);
-      console.log(`==========================================\n`);
-
-      if (!results.length) {
-        showStatus('No valid prices detected.', 'error');
-        progressWrap.classList.add('hidden');
-
-        /* Still render debug even on failure */
-        if (debugCard) {
-          Perf.start('debug_render');
-          renderDebugOverlay(grayCanvas, finalRowResults);
-          renderDebugTable(finalRowResults, perf);
-          debugCard.classList.remove('hidden');
-          Perf.end('debug_render');
-        }
-        return;
-      }
-
-      // Calculate median
-      const median = calculateMedian(results);
-      const formattedMedian = formatPrice(median);
-      const formattedList = results.map(formatPrice).join(', ');
-
-      outputBox.value = `Extracted Prices: ${formattedList}\nMedian Price: ${formattedMedian}`;
-      valueToCopy = formattedMedian;
-
-      resultCard.classList.remove('hidden');
-      updateCountBadge(results.length, true);
-      countBadge.classList.remove('hidden');
-      copyBtn.disabled = false;
-      progressWrap.classList.add('hidden');
-      await copyToClipboard(valueToCopy);
-      showStatus(`Extraction complete — Median price ${formattedMedian} copied to clipboard.`, 'success');
-
-      /* --- Debug rendering --- */
-      if (debugCard) {
-        Perf.start('debug_render');
-        renderDebugOverlay(grayCanvas, finalRowResults);
-        renderDebugTable(finalRowResults, perf);
-        debugCard.classList.remove('hidden');
-        perf.debug_render = Perf.end('debug_render');
-      }
+      await finishMedianExtraction(listType, recog, bank, grayCanvas, perf);
 
     } else {
       /* --- Original MLS# Pipeline --- */
@@ -2224,7 +2468,7 @@ async function runExtraction() {
       valueToCopy = outputBox.value;
 
       resultCard.classList.remove('hidden');
-      updateCountBadge(results.length, false);
+      updateCountBadge(results.length, 'MLS numbers');
       countBadge.classList.remove('hidden');
       copyBtn.disabled = false;
       progressWrap.classList.add('hidden');
