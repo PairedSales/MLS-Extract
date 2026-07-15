@@ -363,32 +363,78 @@ function mergeClosest(segs, target) {
   return segs;
 }
 
-/** Split the widest segment at its projection minimum until we reach the target count. */
+/**
+ * Split segments to reach the target count.
+ * Digits are allocated to segments proportionally to width (largest-remainder),
+ * then each multi-digit segment is split at projection minima near the expected
+ * uniform boundaries. A pure center-biased split fails on 3+ merged digits
+ * (e.g. "443" where the 4's crossbar touches the next glyph): the true
+ * boundaries sit at 1/3 and 2/3, so a center split cuts through a glyph.
+ */
 function splitWidest(segs, vP, minW, target) {
   segs = segs.slice();
-  while (segs.length < target) {
-    let maxW = 0, maxIdx = -1;
+  if (segs.length >= target) return segs;
+
+  const totalW = segs.reduce((s, g) => s + g.w, 0);
+  if (totalW <= 0) return segs;
+
+  /* Allocate digit counts proportionally to segment width */
+  const quotas = segs.map(g => (g.w * target) / totalW);
+  const counts = quotas.map(q => Math.max(1, Math.floor(q)));
+  let assigned = counts.reduce((s, n) => s + n, 0);
+  while (assigned < target) {
+    /* Give the next digit to the segment furthest below its quota */
+    let best = -1, bestDeficit = -Infinity;
     for (let i = 0; i < segs.length; i++) {
-      if (segs[i].w > maxW) { maxW = segs[i].w; maxIdx = i; }
+      const deficit = quotas[i] - counts[i];
+      if (deficit > bestDeficit) { bestDeficit = deficit; best = i; }
     }
-    if (maxIdx < 0 || maxW < minW * 2) break;
-    const seg = segs[maxIdx];
-    const lo = seg.x + Math.floor(seg.w * 0.25);
-    const hi = seg.x + Math.floor(seg.w * 0.75);
-    const center = seg.x + seg.w / 2;
+    counts[best]++;
+    assigned++;
+  }
+  while (assigned > target) {
+    /* Take back from the segment furthest above its quota (keep ≥ 1 each) */
+    let best = -1, bestExcess = -Infinity;
+    for (let i = 0; i < segs.length; i++) {
+      if (counts[i] <= 1) continue;
+      const excess = counts[i] - quotas[i];
+      if (excess > bestExcess) { bestExcess = excess; best = i; }
+    }
+    if (best < 0) break;
+    counts[best]--;
+    assigned--;
+  }
+
+  const out = [];
+  for (let i = 0; i < segs.length; i++) {
+    out.push(...splitSegmentInto(segs[i], vP, minW, counts[i]));
+  }
+  return out;
+}
+
+/** Split one segment into n parts at projection minima near uniform boundaries. */
+function splitSegmentInto(seg, vP, minW, n) {
+  if (n <= 1 || seg.w < minW * 2) return [seg];
+  const end = seg.x + seg.w;
+  const digitW = seg.w / n;
+  const parts = [];
+  let sx = seg.x;
+  for (let k = 1; k < n; k++) {
+    const expected = seg.x + digitW * k;
+    const halfWin = digitW * 0.3;
+    const lo = Math.max(sx + minW, Math.round(expected - halfWin));
+    const hi = Math.min(end - minW * (n - k), Math.round(expected + halfWin));
+    if (lo > hi) return [seg];
     let minVal = Infinity, minPos = -1;
     for (let x = lo; x <= hi; x++) {
-      const dist = Math.abs(x - center);
-      const val = vP[x] + dist * 1.5;
+      const val = vP[x] + Math.abs(x - expected) * 1.5;
       if (val < minVal) { minVal = val; minPos = x; }
     }
-    if (minPos < 0) break;
-    const left  = { x: seg.x, w: minPos - seg.x };
-    const right = { x: minPos, w: seg.x + seg.w - minPos };
-    if (left.w < minW || right.w < minW) break;
-    segs.splice(maxIdx, 1, left, right);
+    parts.push({ x: sx, w: minPos - sx });
+    sx = minPos;
   }
-  return segs;
+  parts.push({ x: sx, w: end - sx });
+  return parts.every(p => p.w >= minW) ? parts : [seg];
 }
 
 /**
