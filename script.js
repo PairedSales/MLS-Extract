@@ -30,6 +30,14 @@ const CFG = {
     [5, 6], [6, 9], [1, 7], [8, 9],
   ],
 
+  /* Row-shading normalization (selected/alternating row highlights) */
+  SHADE_LEVEL_PCT: 0.50,        // Percentile taken as a scanline's dominant surface
+  SHADE_FG_PCT: 0.02,           // Percentile taken as an ink level (mirrored for light text)
+  SHADE_MIN_DELTA: 12,          // How much darker than the page a band must be
+  SHADE_MIN_BAND_H_SRC: 3,      // Min band height (source px) — skips rules & borders
+  SHADE_MIN_CONTRAST: 20,       // Min fill−ink spread inside a band before rescaling
+  SHADE_MIN_PAGE_CONTRAST: 40,  // Min page-wide bg−ink spread for a usable target
+
   /* Segmentation */
   MIN_ROW_DENSITY: 0.012,       // Fraction of dark pixels per row for text detection
   MIN_DIGIT_W_SRC: 2,           // Min digit segment width (source px)
@@ -229,6 +237,134 @@ function toGrayscale(canvas) {
   }
   ctx.putImageData(img, 0, 0);
   return canvas;
+}
+
+/** Value at percentile `p` (0–1) of a 256-bin histogram holding `total` samples. */
+function histPercentile(hist, total, p) {
+  const want = Math.max(1, Math.round(total * p));
+  let seen = 0;
+  for (let v = 0; v < 256; v++) {
+    seen += hist[v];
+    if (seen >= want) return v;
+  }
+  return 255;
+}
+
+/**
+ * Neutralize row shading — the coloured highlight a grid paints behind the
+ * selected row (and similar banded backgrounds).
+ *
+ * A shaded band's background is darker than the rest of the table, and the
+ * single global Otsu threshold applied afterwards cannot serve both. Depending
+ * on how dark the highlight is, the band either binarizes to a solid block —
+ * losing that row outright — or loses enough contrast that its digits merge and
+ * segmentation returns the wrong count. The band's extra dark pixels also skew
+ * the global threshold, so one highlighted row shifts the result for every
+ * other row in the image.
+ *
+ * Each shaded band is linearly rescaled so its background and ink levels match
+ * the unshaded rows, which restores both the band itself and the global
+ * histogram. Operates on (and expects) a grayscale canvas. An image with no
+ * shaded bands is left unchanged.
+ *
+ * Returns the list of bands that were normalized.
+ */
+function normalizeShadedBands(canvas) {
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  const W = canvas.width, H = canvas.height;
+  const img = ctx.getImageData(0, 0, W, H);
+  const d = img.data;
+
+  /* Dominant surface level per scanline. The median is deliberate: it lands on
+   * whichever colour fills most of the scanline, so it reports the fill for a
+   * dark highlight (light text) just as reliably as the paper for ordinary
+   * dark-on-light text. A high percentile would latch onto light glyphs and
+   * miss dark bands entirely. */
+  const levelOf = new Uint8Array(H);
+  const line = new Uint32Array(256);
+  for (let y = 0; y < H; y++) {
+    line.fill(0);
+    const base = y * W * 4;
+    for (let x = 0; x < W; x++) line[d[base + x * 4]]++;
+    levelOf[y] = histPercentile(line, W, CFG.SHADE_LEVEL_PCT);
+  }
+
+  /* Page background = median scanline level. Robust as long as shaded rows
+   * are the minority; if most of the table is shaded there is no unshaded
+   * reference to normalize toward and we correctly do nothing. */
+  const pageBg = [...levelOf].sort((a, b) => a - b)[H >> 1];
+  const shaded = new Uint8Array(H);
+  let shadedCount = 0;
+  for (let y = 0; y < H; y++) {
+    if (levelOf[y] <= pageBg - CFG.SHADE_MIN_DELTA) { shaded[y] = 1; shadedCount++; }
+  }
+  if (shadedCount === 0) return [];
+
+  /* Page ink level, measured only where the page is not shaded. */
+  const pageHist = new Uint32Array(256);
+  let pageN = 0;
+  for (let y = 0; y < H; y++) {
+    if (shaded[y]) continue;
+    const base = y * W * 4;
+    for (let x = 0; x < W; x++) { pageHist[d[base + x * 4]]++; pageN++; }
+  }
+  const pageFg = histPercentile(pageHist, pageN, CFG.SHADE_FG_PCT);
+  if (pageBg - pageFg < CFG.SHADE_MIN_PAGE_CONTRAST) return [];
+
+  /* Group shaded scanlines into contiguous bands. */
+  const bands = [];
+  let inside = false, sy = 0;
+  for (let y = 0; y <= H; y++) {
+    const s = y < H ? shaded[y] : 0;
+    if (s) { if (!inside) { sy = y; inside = true; } }
+    else if (inside) { bands.push({ y: sy, h: y - sy }); inside = false; }
+  }
+
+  const minH = CFG.SHADE_MIN_BAND_H_SRC * CFG.UPSCALE;
+  const applied = [];
+  for (const band of bands) {
+    /* Thin bands are rules, borders and underlines, not row highlights. */
+    if (band.h < minH) continue;
+
+    const bandHist = new Uint32Array(256);
+    let bandN = 0;
+    for (let y = band.y; y < band.y + band.h; y++) {
+      const base = y * W * 4;
+      for (let x = 0; x < W; x++) { bandHist[d[base + x * 4]]++; bandN++; }
+    }
+    /* The fill is whatever covers most of the band, so its level is the band
+     * median — true for any glyph coverage, unlike an outer percentile, which
+     * collapses onto the fill once the text is sparse. The glyphs are then the
+     * extreme lying furthest from that fill, on whichever side that is: dark
+     * text on a light highlight, or light text on a dark one. */
+    const bandBg = histPercentile(bandHist, bandN, 0.5);
+    const darkEnd = histPercentile(bandHist, bandN, CFG.SHADE_FG_PCT);
+    const lightEnd = histPercentile(bandHist, bandN, 1 - CFG.SHADE_FG_PCT);
+
+    const inverted = (lightEnd - bandBg) > (bandBg - darkEnd);
+    const bandFg = inverted ? lightEnd : darkEnd;
+
+    /* A flat band carries no text to recover; rescaling it only amplifies
+     * noise, so leave solid fills, rules and gradients alone. */
+    const contrast = Math.abs(bandBg - bandFg);
+    if (contrast < CFG.SHADE_MIN_CONTRAST) continue;
+
+    const scale = (pageBg - pageFg) / contrast;
+    for (let y = band.y; y < band.y + band.h; y++) {
+      const base = y * W * 4;
+      for (let x = 0; x < W; x++) {
+        const i = base + x * 4;
+        /* 0 at the glyph level, `contrast` at the fill level, either polarity. */
+        const rel = inverted ? bandFg - d[i] : d[i] - bandFg;
+        const v = Math.max(0, Math.min(255, Math.round(pageFg + rel * scale)));
+        d[i] = d[i + 1] = d[i + 2] = v;
+      }
+    }
+    applied.push({ ...band, bandBg, bandFg, scale, inverted });
+  }
+
+  if (applied.length) ctx.putImageData(img, 0, 0);
+  return applied;
 }
 
 /** Compute Otsu's optimal binarization threshold for a grayscale array. */
@@ -1978,6 +2114,15 @@ async function runExtraction() {
     console.log(`[Pre] Upscaled ${CFG.UPSCALE}× → ${up.width}×${up.height}`);
 
     toGrayscale(up);
+
+    /* Flatten selected-row highlights before the global threshold is chosen,
+     * so a shaded band neither swallows its own row nor skews the rest. */
+    const shadedBands = normalizeShadedBands(up);
+    if (shadedBands.length) {
+      console.log(`[Pre] Normalized ${shadedBands.length} shaded band(s): ` +
+        shadedBands.map(b => `y=${b.y} h=${b.h} bg=${b.bandBg}→ink=${b.bandFg} ×${b.scale.toFixed(2)}${b.inverted ? ' (inverted)' : ''}`).join('; '));
+    }
+
     const grayCanvas = cloneCanvas(up); /* Keep grayscale for glyph extraction */
     const thr = binarize(up);           /* Binarize for segmentation */
     console.log(`[Pre] Otsu threshold: ${thr}`);
