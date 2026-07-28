@@ -3,5 +3,25 @@
     "file": "clean/Sample.png",
     "label": "Sample — 4 MLS numbers, clean screenshot",
     "expected": ["12401432", "12487333", "12349664", "12375820"]
+  },
+  {
+    "file": "shaded/selected-row-light.png",
+    "label": "Shaded — light-blue selected row, dark text",
+    "expected": ["12548300", "12630428", "12272485", "12513418", "12487613"]
+  },
+  {
+    "file": "shaded/selected-row-vivid.png",
+    "label": "Shaded — vivid-blue selected row, white text",
+    "expected": ["12548300", "12630428", "12272485", "12513418", "12487613"]
+  },
+  {
+    "file": "shaded/selected-row-wide.png",
+    "label": "Shaded — light-blue selected row in a 24-row column",
+    "expected": [
+      "12548300", "12630428", "12272485", "12513418", "12487613", "12391601",
+      "12573657", "12600214", "12596916", "12540716", "12339497", "12613469",
+      "12556758", "12630698", "12548598", "12331351", "12592089", "12387129",
+      "12157315", "12404968", "12636048", "12404929", "12379575", "12604577"
+    ]
   }
 ]
