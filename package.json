@@ -4,7 +4,11 @@
   "description": "",
   "main": "script.js",
   "scripts": {
-    "test": "node test-pup.js"
+    "test": "node test-pup.js",
+    "test:baseline": "node test-baseline.js",
+    "test:price": "node test-price.js",
+    "test:fullpage": "node test-fullpage.js",
+    "fixture:fullpage": "node tests/make-fullpage-fixture.js"
   },
   "repository": {
     "type": "git",

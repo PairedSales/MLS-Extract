@@ -50,6 +50,17 @@ const CFG = {
   /* Sub-pixel alignment: ±1px shifts for NCC matching */
   NCC_SHIFT_OFFSETS: [[0,0], [1,0], [-1,0], [0,1], [0,-1]],
 
+  /* Full-page column isolation (multi-column screenshots) */
+  MLS_DIGITS: 8,                // Digit count that identifies the MLS # column
+  COL_MIN_BANDS: 3,             // Bands required before treating input as a full page
+  COL_GUTTER_RATIO: 0.5,        // Min gutter width as a fraction of median row height
+  COL_HLINE_RATIO: 0.5,         // Horizontal ink run ≥ this × width → table border
+  COL_VLINE_RATIO: 3.0,         // Vertical ink run ≥ this × median row height → separator
+  COL_MIN_COVERAGE: 0.4,        // Min fraction of rows a band must fill with 8 segments
+  COL_SAMPLE_ROWS: 8,           // Rows classified per candidate band while scoring
+  COL_MIN_VALID: 0.35,          // Min fraction of sampled rows yielding 8 clean digits
+  COL_PAD_SRC: 3,               // Padding (source px) kept around the isolated column
+
   /* Reference image */
   REF_IMAGE: 'reference-digits.png',
   REF_DIGIT_ORDER: [1, 2, 3, 4, 5, 6, 7, 8, 9, 0],
@@ -207,6 +218,16 @@ function cloneCanvas(src) {
   return c;
 }
 
+/** Crop a rectangular region out of a canvas into a new canvas. */
+function cropCanvas(src, x, y, w, h) {
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(src, x, y, w, h, 0, 0, w, h);
+  return c;
+}
+
 /** Upscale canvas with nearest-neighbor (preserves sharp pixel edges). */
 function upscaleCanvas(src, factor) {
   const c = document.createElement('canvas');
@@ -317,10 +338,16 @@ function findRows(hP, W, minRatio) {
   return rows;
 }
 
-/** Vertical projection within a row: count ink pixels per column. */
-function vProjection(bin, W, ry, rh) {
+/**
+ * Vertical projection within a row: count ink pixels per column.
+ * Optionally restricted to the x-range [bx, bx+bw); columns outside stay 0 so
+ * segment coordinates remain absolute.
+ */
+function vProjection(bin, W, ry, rh, bx = 0, bw = W) {
   const p = new Uint32Array(W);
-  for (let x = 0; x < W; x++) {
+  const x0 = Math.max(0, bx);
+  const x1 = Math.min(W, bx + bw);
+  for (let x = x0; x < x1; x++) {
     let c = 0;
     for (let y = ry; y < ry + rh; y++) {
       if (bin[y * W + x] === 0) c++;
@@ -1534,7 +1561,225 @@ function marginClass(margin) {
 }
 
 /* ================================================================== */
-/*  SECTION 10 — MAIN PIPELINE                                        */
+/*  SECTION 10 — FULL-PAGE COLUMN ISOLATION                           */
+/* ================================================================== */
+
+/*
+ * A full-page MLS scan holds ~20 columns. The recognizer only knows how to
+ * read a single column of 8-digit numbers, so before anything else we find the
+ * MLS # column and crop to it. The image then looks exactly like the
+ * pre-cropped screenshots the rest of the pipeline already handles.
+ */
+
+/**
+ * Binarize + detect row bands for an upscaled grayscale canvas.
+ * Returns { gray, bin, W, H, rows, thr }.
+ */
+function analyzeSurface(grayCanvas) {
+  const work = cloneCanvas(grayCanvas);
+  const thr = binarize(work);
+  const bin = getBinary(work);
+  const W = work.width, H = work.height;
+
+  const hP = hProjection(bin, W, H);
+  const rawRows = findRows(hP, W, CFG.MIN_ROW_DENSITY);
+  const minH = CFG.UPSCALE * 5;
+  const maxH = CFG.UPSCALE * 30;
+  const rows = rawRows.filter(r => r.h >= minH && r.h <= maxH);
+
+  return { gray: grayCanvas, bin, W, H, rows, rawRows, thr, minH, maxH };
+}
+
+/** Median row-band height, used to scale every gutter/gridline threshold. */
+function medianRowHeight(rows) {
+  if (!rows.length) return CFG.UPSCALE * 8;
+  const hs = rows.map(r => r.h).sort((a, b) => a - b);
+  return hs[Math.floor(hs.length / 2)];
+}
+
+/**
+ * Copy `bin` with table rules erased: any horizontal ink run spanning a large
+ * fraction of the width, or any vertical run far taller than a text row, is a
+ * border rather than a glyph. Left in place they bridge every gutter and the
+ * page reads as one solid column.
+ */
+function suppressGridLines(bin, W, H, medH) {
+  const out = Uint8Array.from(bin);
+  const hMin = Math.max(8, Math.round(W * CFG.COL_HLINE_RATIO));
+  const vMin = Math.max(8, Math.round(medH * CFG.COL_VLINE_RATIO));
+
+  /* Horizontal rules */
+  for (let y = 0; y < H; y++) {
+    const base = y * W;
+    let run = 0;
+    for (let x = 0; x <= W; x++) {
+      const ink = x < W && bin[base + x] === 0;
+      if (ink) { run++; continue; }
+      if (run >= hMin) for (let k = x - run; k < x; k++) out[base + k] = 1;
+      run = 0;
+    }
+  }
+
+  /* Vertical rules */
+  for (let x = 0; x < W; x++) {
+    let run = 0;
+    for (let y = 0; y <= H; y++) {
+      const ink = y < H && bin[y * W + x] === 0;
+      if (ink) { run++; continue; }
+      if (run >= vMin) for (let k = y - run; k < y; k++) out[k * W + x] = 1;
+      run = 0;
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Split the page into column bands: x-ranges of ink separated by gutters that
+ * are empty in *every* text row. Ragged cell contents never close a gutter, so
+ * only real column padding survives.
+ */
+function findColumnBands(bin, W, rows, medH) {
+  const inked = new Uint8Array(W);
+  for (const row of rows) {
+    for (let y = row.y; y < row.y + row.h; y++) {
+      const base = y * W;
+      for (let x = 0; x < W; x++) {
+        if (bin[base + x] === 0) inked[x] = 1;
+      }
+    }
+  }
+
+  const minGutter = Math.max(2, Math.round(medH * CFG.COL_GUTTER_RATIO));
+  const minBandW = CFG.MIN_DIGIT_W_SRC * CFG.UPSCALE;
+  const bands = [];
+
+  let x = 0;
+  while (x < W) {
+    if (!inked[x]) { x++; continue; }
+
+    const start = x;
+    let end = x, gap = 0;
+    x++;
+    while (x < W) {
+      if (inked[x]) { end = x; gap = 0; }
+      else if (++gap >= minGutter) break;
+      x++;
+    }
+    bands.push({ x: start, w: end - start + 1 });
+  }
+
+  return bands.filter(b => b.w >= minBandW);
+}
+
+/**
+ * Score one band as an MLS # candidate.
+ *
+ * Coverage comes first (cheap): the MLS column segments into exactly 8 glyphs
+ * in nearly every row, which drops short numerics, dates and street names.
+ * Bands that survive get a sample of rows classified, which is what separates
+ * MLS numbers from the other 8-glyph cells — "$755,000" segments into 8 too,
+ * but its glyphs come back as '$' and a comma rather than digits.
+ */
+function scoreColumnBand(band, surf, bank) {
+  const { bin, W, rows, gray } = surf;
+  const minDW = CFG.MIN_DIGIT_W_SRC * CFG.UPSCALE;
+  const minDH = CFG.MIN_DIGIT_H_SRC * CFG.UPSCALE;
+  const target = CFG.MLS_DIGITS;
+
+  /* Projection-only segmentation: the connected-component fallback is not
+   * band-aware and would scan the whole page width for every row. */
+  const candidates = [];
+  for (const row of rows) {
+    const vP = vProjection(bin, W, row.y, row.h, band.x, band.w);
+    const { segs } = findDigitSegments(vP, minDW, target);
+    if (segs.length === target) candidates.push({ row, segs });
+  }
+
+  const coverage = rows.length ? candidates.length / rows.length : 0;
+  if (coverage < CFG.COL_MIN_COVERAGE) {
+    return { band, coverage, valid: 0, score: 0, reason: 'coverage' };
+  }
+
+  /* Classify an evenly spread sample rather than every row. */
+  const step = Math.max(1, Math.floor(candidates.length / CFG.COL_SAMPLE_ROWS));
+  const sample = [];
+  for (let i = 0; i < candidates.length && sample.length < CFG.COL_SAMPLE_ROWS; i += step) {
+    sample.push(candidates[i]);
+  }
+
+  let valid = 0, scoreSum = 0;
+  for (const { row, segs } of sample) {
+    let num = '', worst = 1;
+    for (const seg of segs) {
+      const bb = tightBBox(bin, W, seg.x, row.y, seg.w, row.h);
+      if (!bb || bb.w < 3 || bb.h < minDH) { num += '?'; worst = 0; break; }
+      const glyph = normalizeGlyph(gray, bb.x, bb.y, bb.w, bb.h);
+      glyph.features = computeStructuralFeatures(glyph.binary, CFG.NORM_W, CFG.NORM_H, glyph.grayscale);
+      const cls = classifyGlyph(glyph, bank);
+      num += String(cls.digit);
+      worst = Math.min(worst, cls.score);
+    }
+    if (/^\d{8}$/.test(num) && worst >= CFG.MIN_DIGIT_SCORE) {
+      valid++;
+      scoreSum += worst;
+    }
+  }
+
+  const validFrac = sample.length ? valid / sample.length : 0;
+  if (validFrac < CFG.COL_MIN_VALID) {
+    return { band, coverage, valid: validFrac, score: 0, reason: 'not-digits' };
+  }
+
+  const meanScore = valid ? scoreSum / valid : 0;
+  return {
+    band, coverage, valid: validFrac, reason: 'ok',
+    score: coverage * 0.35 + validFrac * 0.45 + meanScore * 0.2,
+  };
+}
+
+/**
+ * Locate the MLS # column in a multi-column scan.
+ * Returns { x, w } in upscaled coordinates, or null when the image is already a
+ * single column (or no band looks like MLS numbers).
+ */
+function isolateMlsColumn(surf, bank) {
+  const { bin, W, H, rows } = surf;
+  if (rows.length < 3) return null;
+
+  const medH = medianRowHeight(rows);
+  const clean = suppressGridLines(bin, W, H, medH);
+  const bands = findColumnBands(clean, W, rows, medH);
+  console.log(`[Column] ${bands.length} bands (medH=${medH}, gutter≥${Math.max(2, Math.round(medH * CFG.COL_GUTTER_RATIO))}px)`);
+
+  if (bands.length < CFG.COL_MIN_BANDS) {
+    console.log(`[Column] < ${CFG.COL_MIN_BANDS} bands → already a single column, no isolation`);
+    return null;
+  }
+
+  const scan = { ...surf, bin: clean };
+  let best = null;
+  for (const band of bands) {
+    const res = scoreColumnBand(band, scan, bank);
+    console.log(`[Column] band x=${band.x} w=${band.w}: coverage=${res.coverage.toFixed(2)} valid=${res.valid.toFixed(2)} score=${res.score.toFixed(3)} (${res.reason})`);
+    if (res.score > 0 && (!best || res.score > best.score)) best = res;
+  }
+
+  if (!best) {
+    console.log('[Column] No band matched the MLS # signature — falling back to full image');
+    return null;
+  }
+
+  /* Pad, then snap to the upscale grid so cropping stays pixel-exact. */
+  const pad = CFG.COL_PAD_SRC * CFG.UPSCALE;
+  const x0 = Math.max(0, Math.floor((best.band.x - pad) / CFG.UPSCALE) * CFG.UPSCALE);
+  const x1 = Math.min(W, Math.ceil((best.band.x + best.band.w + pad) / CFG.UPSCALE) * CFG.UPSCALE);
+  console.log(`[Column] Isolated MLS # column at x=${x0}–${x1} (score ${best.score.toFixed(3)})`);
+  return { x: x0, w: x1 - x0 };
+}
+
+/* ================================================================== */
+/*  SECTION 11 — MAIN PIPELINE                                        */
 /* ================================================================== */
 
 /**
@@ -1978,9 +2223,6 @@ async function runExtraction() {
     console.log(`[Pre] Upscaled ${CFG.UPSCALE}× → ${up.width}×${up.height}`);
 
     toGrayscale(up);
-    const grayCanvas = cloneCanvas(up); /* Keep grayscale for glyph extraction */
-    const thr = binarize(up);           /* Binarize for segmentation */
-    console.log(`[Pre] Otsu threshold: ${thr}`);
     perf.preprocessing = Perf.end('preprocessing');
     updateProgress(15);
 
@@ -1990,33 +2232,46 @@ async function runExtraction() {
     /* --- Row detection --- */
     Perf.start('segmentation');
     showStatus('Detecting rows…', 'info');
-    const bin = getBinary(up);
-    const hP = hProjection(bin, up.width, up.height);
-    const rawRows = findRows(hP, up.width, CFG.MIN_ROW_DENSITY);
-    console.log(`[Seg] ${rawRows.length} raw row bands`);
+    let surf = analyzeSurface(up);
+    console.log(`[Pre] Otsu threshold: ${surf.thr}`);
+    console.log(`[Seg] ${surf.rawRows.length} raw row bands`);
+    console.log(`[Seg] ${surf.rows.length} rows after height filter [${surf.minH}–${surf.maxH}px]`);
 
-    const minH = CFG.UPSCALE * 5;
-    const maxH = CFG.UPSCALE * 30;
-    const rows = rawRows.filter(r => r.h >= minH && r.h <= maxH);
-    console.log(`[Seg] ${rows.length} rows after height filter [${minH}–${maxH}px]`);
+    /* --- Full-page column isolation ---
+     * A multi-column scan is cropped down to the MLS # column, then re-analyzed
+     * so binarization and row bands are computed on the isolated column alone. */
+    Perf.start('column_isolation');
+    const column = isolateMlsColumn(surf, bank);
+    if (column) {
+      showStatus('Isolating MLS # column…', 'info');
+      const cropped = cropCanvas(surf.gray, column.x, 0, column.w, surf.gray.height);
+      surf = analyzeSurface(cropped);
+      console.log(`[Column] Re-analyzed crop ${surf.W}×${surf.H}: Otsu ${surf.thr}, ${surf.rows.length} rows`);
+    }
+    perf.column_isolation = Perf.end('column_isolation');
+
+    const grayCanvas = surf.gray;  /* Grayscale source for glyph extraction */
+    const bin = surf.bin;          /* Binary array for segmentation */
+    const rows = surf.rows;
     perf.segmentation = Perf.end('segmentation');
     updateProgress(25);
 
-    /* --- Price Pipeline Detection --- */
+    /* --- Price Pipeline Detection ---
+     * Skipped once a column was isolated: that path already committed to MLS #. */
     let isPricePipeline = false;
     let dollarMatches = 0;
-    const testRows = rows.slice(0, Math.min(5, rows.length));
+    const testRows = column ? [] : rows.slice(0, Math.min(5, rows.length));
     const minDW_price = Math.max(4, Math.floor(CFG.MIN_DIGIT_W_SRC * CFG.UPSCALE / 2));
     const minDH_price = Math.max(4, Math.floor(CFG.MIN_DIGIT_H_SRC * CFG.UPSCALE / 2));
 
     for (const row of testRows) {
-      const vP = vProjection(bin, up.width, row.y, row.h);
+      const vP = vProjection(bin, surf.W, row.y, row.h);
       let segs = findSegmentsRaw(vP, minDW_price);
       segs = splitWideSegments(segs, vP, minDW_price);
       if (segs.length === 0) continue;
 
       const firstSeg = segs[0];
-      const bb = tightBBox(bin, up.width, firstSeg.x, row.y, firstSeg.w, row.h);
+      const bb = tightBBox(bin, surf.W, firstSeg.x, row.y, firstSeg.w, row.h);
       if (!bb || bb.w < 2 || bb.h < minDH_price) continue;
 
       const glyph = normalizeGlyph(grayCanvas, bb.x, bb.y, bb.w, bb.h);
