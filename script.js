@@ -526,7 +526,37 @@ function mergeClosest(segs, target) {
   return segs;
 }
 
-/** Split the widest segment at its projection minimum until we reach the target count. */
+/** Median width of every segment except the one at `skipIdx`. 0 if none left. */
+function medianWidthExcept(segs, skipIdx) {
+  const ws = [];
+  for (let i = 0; i < segs.length; i++) {
+    if (i !== skipIdx) ws.push(segs[i].w);
+  }
+  if (!ws.length) return 0;
+  ws.sort((a, b) => a - b);
+  return ws[ws.length >> 1];
+}
+
+/**
+ * Split the widest segment until we reach the target count.
+ *
+ * Cuts are scored on the vertical projection, biased toward where a boundary is
+ * expected so one never settles into the hollow of a loop — the lowest column
+ * inside a '0' or an '8' is not a gap.
+ *
+ * How many boundaries to expect is the whole trick. A blob is not always two
+ * glyphs: at a threshold running a few levels hot, a '4' bleeds into its right
+ * neighbour and drags a third glyph into the same run. Biasing such a run
+ * toward its centre aims the cut squarely at the middle glyph — for "548" the
+ * lowest weighted column lands inside the '4', which then splits into a stub
+ * plus a '4'+'8' smear, and the row is lost.
+ *
+ * So the run is first sized against the row's other segments: a run about k
+ * digits wide has its boundaries near the k−1 interior k-ths, and each
+ * candidate is weighted by its distance to the closest one. A two-glyph run
+ * (k = 2) has a single ideal boundary at the centre, which is exactly the
+ * previous behaviour; wider runs are the ones that now aim correctly.
+ */
 function splitWidest(segs, vP, minW, target) {
   segs = segs.slice();
   while (segs.length < target) {
@@ -538,10 +568,23 @@ function splitWidest(segs, vP, minW, target) {
     const seg = segs[maxIdx];
     const lo = seg.x + Math.floor(seg.w * 0.25);
     const hi = seg.x + Math.floor(seg.w * 0.75);
-    const center = seg.x + seg.w / 2;
+
+    /* Glyphs this run probably holds, measured against the row's clean ones.
+     * Never fewer than 2 (it is being split) and never more than the number of
+     * segments still owed, so a stray wide blob cannot over-fragment. */
+    const dw = medianWidthExcept(segs, maxIdx);
+    const owed = target - segs.length + 1;
+    let k = dw > 0 ? Math.round(seg.w / dw) : 2;
+    k = Math.max(2, Math.min(k, Math.max(2, owed)));
+
+    /* Ideal boundaries: the k−1 interior k-ths of the run. */
+    const ideals = [];
+    for (let i = 1; i < k; i++) ideals.push(seg.x + (seg.w * i) / k);
+
     let minVal = Infinity, minPos = -1;
     for (let x = lo; x <= hi; x++) {
-      const dist = Math.abs(x - center);
+      let dist = Infinity;
+      for (const p of ideals) dist = Math.min(dist, Math.abs(x - p));
       const val = vP[x] + dist * 1.5;
       if (val < minVal) { minVal = val; minPos = x; }
     }
@@ -2368,7 +2411,7 @@ async function runExtraction() {
         shadedBands.map(b => `y=${b.y} h=${b.h} bg=${b.bandBg}→ink=${b.bandFg} ×${b.scale.toFixed(2)}${b.inverted ? ' (inverted)' : ''}`).join('; '));
     }
 
-    const grayCanvas = cloneCanvas(up); /* Keep grayscale for glyph extraction */
+    let grayCanvas = cloneCanvas(up);   /* Keep grayscale for glyph extraction */
     const thr = binarize(up);           /* Binarize for segmentation */
     console.log(`[Pre] Otsu threshold: ${thr}`);
     perf.preprocessing = Perf.end('preprocessing');
@@ -2380,7 +2423,7 @@ async function runExtraction() {
     /* --- Row detection --- */
     Perf.start('segmentation');
     showStatus('Detecting rows…', 'info');
-    const bin = getBinary(up);
+    let bin = getBinary(up);
     const hP = hProjection(bin, up.width, up.height);
     const rawRows = findRows(hP, up.width, CFG.MIN_ROW_DENSITY);
     console.log(`[Seg] ${rawRows.length} raw row bands`);
@@ -2401,6 +2444,11 @@ async function runExtraction() {
       showStatus('Isolating MLS # column…', 'info');
       const cropped = cropCanvas(grayCanvas, column.x, 0, column.w, grayCanvas.height);
       const surfCropped = analyzeSurface(cropped);
+      /* Everything downstream — segmentation and glyph extraction alike — must
+       * read from the crop; crop-local rows against the full-page bitmap find
+       * nothing. */
+      grayCanvas = surfCropped.gray;
+      bin = surfCropped.bin;
       rows = surfCropped.rows;
       W = surfCropped.W;
       H = surfCropped.H;

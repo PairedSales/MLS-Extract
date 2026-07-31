@@ -8,7 +8,8 @@
     "test:baseline": "node test-baseline.js",
     "test:price": "node test-price.js",
     "test:fullpage": "node test-fullpage.js",
-    "fixture:fullpage": "node tests/make-fullpage-fixture.js"
+    "fixture:fullpage": "node tests/make-fullpage-fixture.js",
+    "fixture:merged": "node tests/make-merged-fixture.js"
   },
   "repository": {
     "type": "git",
