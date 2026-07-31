@@ -5,6 +5,16 @@
     "expected": ["12401432", "12487333", "12349664", "12375820"]
   },
   {
+    "file": "clean/merged-glyphs.png",
+    "label": "Merged — short column where a '4' bleeds into the digit beside it",
+    "expected": ["12548300", "12630428", "12272485", "12513418", "12487613", "12391601"]
+  },
+  {
+    "file": "shaded/three-rows-merged-47.png",
+    "label": "Shaded — 3-row grab, selected last row, '4' merged into the '7' beside it",
+    "expected": ["12647754", "12619461", "12489820"]
+  },
+  {
     "file": "shaded/selected-row-light.png",
     "label": "Shaded — light-blue selected row, dark text",
     "expected": ["12548300", "12630428", "12272485", "12513418", "12487613"]
