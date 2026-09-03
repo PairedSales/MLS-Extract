@@ -33,5 +33,10 @@
       "12556758", "12630698", "12548598", "12331351", "12592089", "12387129",
       "12157315", "12404968", "12636048", "12404929", "12379575", "12604577"
     ]
+  },
+  {
+    "file": "shaded/cropped-with-rules.png",
+    "label": "Shaded — hand crop that keeps the cell borders, clips the header and ends on the selected row",
+    "expected": ["12548300", "12630428", "12272485", "12513418", "12487613"]
   }
 ]
