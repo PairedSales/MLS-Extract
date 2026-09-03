@@ -38,6 +38,10 @@ const CFG = {
   SHADE_MIN_CONTRAST: 20,       // Min fill−ink spread inside a band before rescaling
   SHADE_MIN_PAGE_CONTRAST: 40,  // Min page-wide bg−ink spread for a usable target
 
+  /* Table rules (cell borders a hand-drawn crop keeps) */
+  RULE_SPAN_SLACK_SRC: 2,       // Source px a full-span rule may fall short of an edge
+  RULE_MAX_THICK_SRC: 4,        // Max rule thickness (source px)
+
   /* Segmentation */
   MIN_ROW_DENSITY: 0.012,       // Fraction of dark pixels per row for text detection
   MIN_DIGIT_W_SRC: 2,           // Min digit segment width (source px)
@@ -1757,8 +1761,8 @@ function marginClass(margin) {
 function analyzeSurface(grayCanvas) {
   const work = cloneCanvas(grayCanvas);
   const thr = binarize(work);
-  const bin = getBinary(work);
   const W = work.width, H = work.height;
+  const bin = stripTableRules(getBinary(work), W, H).bin;
 
   const hP = hProjection(bin, W, H);
   const rawRows = findRows(hP, W, CFG.MIN_ROW_DENSITY);
@@ -1811,6 +1815,96 @@ function suppressGridLines(bin, W, H, medH) {
   }
 
   return out;
+}
+
+/**
+ * Erase rules that run edge to edge across the image.
+ *
+ * `suppressGridLines` sizes its thresholds against the median row height, which
+ * is not known until rows have been found — and a cell border running the
+ * height of the crop is exactly what stops them from being found. It puts ink
+ * on every scanline, so the horizontal projection never returns to zero, the
+ * whole image comes back as one over-tall band, and the height filter throws
+ * every row away. A hand-drawn selection that starts on a column separator or
+ * clips the header keeps borders like that routinely.
+ *
+ * Ink reaching both edges needs no row geometry to judge: no glyph spans a
+ * table crop end to end, so a thin run that does is a rule. Thickness is
+ * checked as well, so a solid block — a row that binarized flat, say — is never
+ * mistaken for one.
+ */
+function stripFullSpanRules(bin, W, H) {
+  const out = Uint8Array.from(bin);
+  const slack = CFG.RULE_SPAN_SLACK_SRC * CFG.UPSCALE;
+  const maxThick = CFG.RULE_MAX_THICK_SRC * CFG.UPSCALE;
+
+  /* Vertical: column separators, and the borders a crop begins or ends on. */
+  const vSpan = new Uint8Array(W);
+  const vMin = Math.max(8, H - slack);
+  for (let x = 0; x < W; x++) {
+    let run = 0;
+    for (let y = 0; y < H; y++) {
+      if (bin[y * W + x] === 0) { if (++run >= vMin) { vSpan[x] = 1; break; } }
+      else run = 0;
+    }
+  }
+  for (let x = 0; x < W; x++) {
+    if (!vSpan[x]) continue;
+    let end = x;
+    while (end + 1 < W && vSpan[end + 1]) end++;
+    if (end - x + 1 <= maxThick) {
+      for (let cx = x; cx <= end; cx++) {
+        for (let y = 0; y < H; y++) out[y * W + cx] = 1;
+      }
+    }
+    x = end;
+  }
+
+  /* Horizontal: header underlines and row separators. */
+  const hSpan = new Uint8Array(H);
+  const hMin = Math.max(8, W - slack);
+  for (let y = 0; y < H; y++) {
+    const base = y * W;
+    let run = 0;
+    for (let x = 0; x < W; x++) {
+      if (bin[base + x] === 0) { if (++run >= hMin) { hSpan[y] = 1; break; } }
+      else run = 0;
+    }
+  }
+  for (let y = 0; y < H; y++) {
+    if (!hSpan[y]) continue;
+    let end = y;
+    while (end + 1 < H && hSpan[end + 1]) end++;
+    if (end - y + 1 <= maxThick) {
+      for (let cy = y; cy <= end; cy++) out.fill(1, cy * W, cy * W + W);
+    }
+    y = end;
+  }
+
+  return out;
+}
+
+/**
+ * Strip table rules from a binary image, in the order the thresholds allow.
+ *
+ * Edge-to-edge rules go first, since they need no row geometry. Rows can then
+ * be measured on the cleaned image, which unlocks `suppressGridLines` and the
+ * shorter rules it recognizes — among them a border broken partway down
+ * because the selected row's highlight is painted over it, which reaches
+ * neither edge and would otherwise survive into segmentation as a ninth glyph.
+ *
+ * Returns the cleaned copy and how many ink pixels it dropped.
+ */
+function stripTableRules(bin, W, H) {
+  let out = stripFullSpanRules(bin, W, H);
+
+  const rows = findRows(hProjection(out, W, H), W, CFG.MIN_ROW_DENSITY)
+    .filter(r => r.h >= CFG.UPSCALE * 5 && r.h <= CFG.UPSCALE * 30);
+  if (rows.length) out = suppressGridLines(out, W, H, medianRowHeight(rows));
+
+  let removed = 0;
+  for (let i = 0; i < out.length; i++) if (out[i] !== bin[i]) removed++;
+  return { bin: out, removed };
 }
 
 /**
@@ -2424,6 +2518,14 @@ async function runExtraction() {
     Perf.start('segmentation');
     showStatus('Detecting rows…', 'info');
     let bin = getBinary(up);
+
+    /* Erase cell borders before rows are measured: a border running the full
+     * height of a crop inks every scanline, and row detection then reads the
+     * whole image as one over-tall band and drops every number in it. */
+    const rules = stripTableRules(bin, up.width, up.height);
+    bin = rules.bin;
+    if (rules.removed) console.log(`[Pre] Stripped table rules: ${rules.removed} ink px`);
+
     const hP = hProjection(bin, up.width, up.height);
     const rawRows = findRows(hP, up.width, CFG.MIN_ROW_DENSITY);
     console.log(`[Seg] ${rawRows.length} raw row bands`);
