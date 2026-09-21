@@ -7,10 +7,12 @@
     "test": "node test-pup.js",
     "test:baseline": "node test-baseline.js",
     "test:price": "node test-price.js",
+    "test:ratio": "node test-ratio.js",
     "test:fullpage": "node test-fullpage.js",
     "fixture:fullpage": "node tests/make-fullpage-fixture.js",
     "fixture:merged": "node tests/make-merged-fixture.js",
-    "fixture:cropped": "node tests/make-cropped-fixture.js"
+    "fixture:cropped": "node tests/make-cropped-fixture.js",
+    "fixture:ratio": "node tests/make-ratio-fixtures.js"
   },
   "repository": {
     "type": "git",
