@@ -88,6 +88,9 @@ const CFG = {
   RATIO_MIN_PLAIN_FRAC: 0.5,      // Filled rows reading as bare numbers that make a band plain
   RATIO_MAX_PCT: 1000,            // Ratios beyond this are a misread, not a sale
 
+  /* Result box */
+  OUTPUT_MAX_ROWS: 24,            // Tallest the result box grows before it scrolls
+
   /* Reference image */
   REF_IMAGE: 'reference-digits.png',
   REF_DIGIT_ORDER: [1, 2, 3, 4, 5, 6, 7, 8, 9, 0],
@@ -179,7 +182,7 @@ function handleImageFile(file) {
   previewImg.src = URL.createObjectURL(file);
   previewWrap.classList.remove('hidden');
   extractBtn.disabled = false;
-  outputBox.value = '';
+  setOutput('');
   countBadge.classList.add('hidden');
   resultCard.classList.add('hidden');
   if (debugCard) debugCard.classList.add('hidden');
@@ -193,7 +196,7 @@ function resetState() {
   previewWrap.classList.add('hidden');
   fileInput.value = '';
   extractBtn.disabled = true;
-  outputBox.value = '';
+  setOutput('');
   countBadge.classList.add('hidden');
   resultCard.classList.add('hidden');
   if (debugCard) debugCard.classList.add('hidden');
@@ -2468,6 +2471,26 @@ function formatRatio(pct) {
   return `${pct.toFixed(CFG.RATIO_DECIMALS)}%`;
 }
 
+/**
+ * Lay the ratios out as a column, one sale per line.
+ *
+ * The index and the percentage are each padded to a common width, so in the
+ * monospaced result box the decimal points line up and a long run can be read
+ * down rather than picked out of a comma-separated line.
+ */
+function formatRatioColumn(ratios) {
+  if (!ratios.length) return '';
+
+  const labels = ratios.map((_, i) => String(i + 1));
+  const values = ratios.map(r => formatRatio(r.ratio));
+  const labelW = Math.max(...labels.map(s => s.length));
+  const valueW = Math.max(...values.map(s => s.length));
+
+  return ratios
+    .map((_, i) => `Sale ${labels[i].padStart(labelW)}:  ${values[i].padStart(valueW)}`)
+    .join('\n');
+}
+
 /* ================================================================== */
 /*  SECTION 11 — MAIN PIPELINE                                        */
 /* ================================================================== */
@@ -2955,6 +2978,17 @@ function formatPrice(val) {
   return '$' + val.toLocaleString('en-US');
 }
 
+/**
+ * Put text in the result box, grown to fit it.
+ *
+ * The box is three rows in the markup, which suits a comma-separated line but
+ * hides most of a column of eighteen sales behind a scrollbar.
+ */
+function setOutput(text) {
+  outputBox.value = text;
+  outputBox.rows = Math.min(CFG.OUTPUT_MAX_ROWS, Math.max(3, text.split('\n').length));
+}
+
 /** Update count badge label and count number dynamically. */
 function updateCountBadge(count, noun) {
   const numEl = document.getElementById('count-number');
@@ -2977,7 +3011,7 @@ async function runExtraction() {
   resultCard.classList.add('hidden');
   if (debugCard) debugCard.classList.add('hidden');
   countBadge.classList.add('hidden');
-  outputBox.value = '';
+  setOutput('');
   clearStatus();
   progressWrap.classList.remove('hidden');
   updateProgress(0);
@@ -3071,16 +3105,19 @@ async function runExtraction() {
       updateProgress(100);
       console.log(`==========================================\n`);
 
-      const ratioList = ratioRead.ratios.map(r => formatRatio(r.ratio)).join(', ');
+      const column = formatRatioColumn(ratioRead.ratios);
       const numbers = mls ? mls.results : [];
 
-      outputBox.value = numbers.length
-        ? `Sale/List Ratios: ${ratioList}\nMLS Numbers: ${numbers.join(', ')}`
-        : `Sale/List Ratios: ${ratioList}`;
+      setOutput(numbers.length
+        ? `Sale/List Ratios\n${column}\n\nMLS Numbers: ${numbers.join(', ')}`
+        : `Sale/List Ratios\n${column}`);
 
       /* MLS numbers are what gets pasted back into the grid, so they win the
-       * clipboard whenever the crop carried both. */
-      valueToCopy = numbers.length ? numbers.join(', ') : ratioList;
+       * clipboard whenever the crop carried both. Ratios go out as bare values,
+       * one per line, which drops straight into a spreadsheet column. */
+      valueToCopy = numbers.length
+        ? numbers.join(', ')
+        : ratioRead.ratios.map(r => formatRatio(r.ratio)).join('\n');
 
       resultCard.classList.remove('hidden');
       updateCountBadge(ratioRead.ratios.length, 'sale/list ratios');
@@ -3219,7 +3256,7 @@ async function runExtraction() {
       const formattedMedian = formatPrice(median);
       const formattedList = results.map(formatPrice).join(', ');
 
-      outputBox.value = `Extracted Prices: ${formattedList}\nMedian Price: ${formattedMedian}`;
+      setOutput(`Extracted Prices: ${formattedList}\nMedian Price: ${formattedMedian}`);
       valueToCopy = formattedMedian;
 
       resultCard.classList.remove('hidden');
@@ -3281,7 +3318,7 @@ async function runExtraction() {
         return;
       }
 
-      outputBox.value = results.join(', ');
+      setOutput(results.join(', '));
       valueToCopy = outputBox.value;
 
       resultCard.classList.remove('hidden');

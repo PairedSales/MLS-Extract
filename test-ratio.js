@@ -10,6 +10,9 @@
  * the full page's eighteen — the feature is meant to be indifferent to how much
  * of the grid it is handed. The full page also carries the MLS # column, which
  * keeps the clipboard; the narrow crops have none, so the ratios take it.
+ *
+ * Ratios are reported as a labelled column, one sale per line, padded so the
+ * decimal points line up in the monospaced result box.
  */
 
 const puppeteer = require('puppeteer');
@@ -62,11 +65,14 @@ async function extract(browser, file) {
   const copied = await page.evaluate(() => valueToCopy);
   await page.close();
 
-  const ratioLine = (output.match(/^Sale\/List Ratios: (.*)$/m) || [])[1] || '';
+  /* One "Sale N:  P%" line per sale, padded into a column. */
+  const rows = [...output.matchAll(/^Sale +(\d+): +(\S+)$/gm)];
   const mlsLine = (output.match(/^MLS Numbers: (.*)$/m) || [])[1] || '';
   return {
     output, copied, logs,
-    ratios: ratioLine ? ratioLine.split(', ') : [],
+    ratios: rows.map(m => m[2]),
+    labels: rows.map(m => Number(m[1])),
+    lines: rows.map(m => m[0]),
     numbers: mlsLine ? mlsLine.split(', ') : [],
   };
 }
@@ -105,8 +111,8 @@ function check(ok, message) {
   );
   check(narrow.numbers.length === 0, 'narrow crop reports no MLS numbers — the column is not in the crop');
   check(
-    narrow.copied === NARROW_RATIOS.join(', '),
-    `narrow crop copies the ratios (got "${narrow.copied}")`
+    narrow.copied === NARROW_RATIOS.join('\n'),
+    'narrow crop copies the bare ratios, one per line, for pasting into a spreadsheet column'
   );
 
   console.log('\n--- Full Page ---');
@@ -131,6 +137,25 @@ function check(ok, message) {
   );
   const moved = NARROW_RATIOS.filter((r, i) => r !== NO_CONC_RATIOS[i]).length;
   check(moved === 2, `exactly the 2 rows with concessions change when CONC is cleared (got ${moved})`);
+
+  console.log('\n--- Column Layout ---');
+  /* Eighteen sales is where the layout has to work hardest: the labels go from
+   * one digit to two, and the percentages from five characters to six. */
+  check(
+    grid.labels.join(',') === GRID_RATIOS.map((_, i) => i + 1).join(','),
+    `sales are labelled 1…${GRID_RATIOS.length} in order (got ${grid.labels.join(', ') || 'none'})`
+  );
+  const widths = new Set(grid.lines.map(l => l.length));
+  check(
+    widths.size === 1,
+    `every line is padded to one width, so the decimal points line up `
+      + `(got ${[...widths].sort((a, b) => a - b).join(', ')})`
+  );
+  check(
+    grid.lines[0].startsWith('Sale  1:') && grid.lines[17].startsWith('Sale 18:'),
+    `single-digit labels are padded to meet the double-digit ones `
+      + `(got "${grid.lines[0]}" and "${grid.lines[17]}")`
+  );
 
   console.log('\n--- Parity Between Crops ---');
   const missing = NARROW_RATIOS.filter(r => !grid.ratios.includes(r));
