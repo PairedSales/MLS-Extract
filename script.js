@@ -73,6 +73,21 @@ const CFG = {
   COL_MIN_VALID: 0.35,          // Min fraction of sampled rows yielding 8 clean digits
   COL_PAD_SRC: 3,               // Padding (source px) kept around the isolated column
 
+  /* Sale-to-list ratio columns (Sold Pr / CONC / Orig List Pr) */
+  RATIO_DECIMALS: 1,              // Decimal places in the reported percentage
+  RATIO_GLYPH_H_RATIO: 0.5,       // Tight-bbox height / row height above which a segment is a glyph
+  RATIO_SEP_BASELINE: 0.45,       // A separator's underside must reach this far down the row
+  RATIO_SPACE_GAP_RATIO: 0.25,    // Segment gap / median row height that reads as a space
+  RATIO_MIN_PRICE_DIGITS: 4,      // Integer digits a cell needs before it can be money
+  RATIO_WITNESS_SCORE: 0.80,      // Min score for a glyph to vouch for others in its column
+  RATIO_WITNESS_NCC: 0.92,        // NCC an ambiguous glyph needs against its own digit's instances
+  RATIO_WITNESS_MARGIN: 0.05,     // How far that must beat the best match to any other digit
+  RATIO_MIN_FILLED_ROWS: 2,       // Rows a band must fill before it is worth labelling
+  RATIO_TYPE_BAILOUT_ROWS: 6,     // Filled rows with nothing numeric in them before a band is given up on
+  RATIO_MIN_PRICE_FRAC: 0.6,      // Filled rows reading as money that make a band a price column
+  RATIO_MIN_PLAIN_FRAC: 0.5,      // Filled rows reading as bare numbers that make a band plain
+  RATIO_MAX_PCT: 1000,            // Ratios beyond this are a misread, not a sale
+
   /* Reference image */
   REF_IMAGE: 'reference-digits.png',
   REF_DIGIT_ORDER: [1, 2, 3, 4, 5, 6, 7, 8, 9, 0],
@@ -2052,6 +2067,408 @@ function isolateMlsColumn(surf, bank) {
 }
 
 /* ================================================================== */
+/*  SECTION 10B — SALE-TO-LIST RATIO COLUMNS                          */
+/* ================================================================== */
+
+/*
+ * The ratio needs three cells off the same row — Sold Pr, CONC and Orig List
+ * Pr — so it is read across column bands instead of from one isolated crop.
+ *
+ * The three columns are found by shape rather than by their headers, which the
+ * glyph bank cannot read: in a connectMLS grid the only place a money column is
+ * followed by a plain numeric column — or by a column blank but for its header,
+ * which is how CONC usually looks — and then by a second money column is
+ * Sold Pr -> CONC -> Orig List Pr. Orig List Pr and List Price sit side by side
+ * with no plain column between them, so the signature stays unique. It also
+ * survives any crop that keeps the three columns, which is what lets a narrow
+ * three-column grab and a full-width page take the same path.
+ */
+
+/**
+ * Read the number in one cell: column `band`, row `row`.
+ *
+ * Returns `{ state, value, hasDollar, digitCount, text, digits }`. `state` is
+ * 'empty' for a blank cell, 'value' when the number parsed, and a reject reason
+ * otherwise. `digits` is shaped for the debug renderer either way.
+ *
+ * `lead` says how to treat the first glyph: 'currency' and 'digit' are the
+ * settled answers a typed column supplies, 'auto' works it out per cell.
+ * `witnesses` are confident glyphs from earlier rows of the same column, used
+ * to settle an ambiguous one.
+ */
+function readCell(band, row, surf, bank, medH, lead = 'auto', witnesses = null) {
+  const { bin, gray, W } = surf;
+  const minSegW = 2;
+  const minDH = Math.max(4, Math.floor(CFG.MIN_DIGIT_H_SRC * CFG.UPSCALE / 2));
+  const tallMin = row.h * CFG.RATIO_GLYPH_H_RATIO;
+
+  const vP = vProjection(bin, W, row.y, row.h, band.x, band.w);
+  let segs = splitWideSegments(findSegmentsRaw(vP, minSegW), vP, minSegW);
+  if (!segs.length) return { state: 'empty', digits: [] };
+
+  /* Cut at the first space-sized gap: Sold Pr carries a "(C)" / "(F)" status
+   * suffix that is not part of the number. */
+  const spaceGap = Math.max(12, Math.round(medH * CFG.RATIO_SPACE_GAP_RATIO));
+  for (let i = 0; i < segs.length - 1; i++) {
+    if (segs[i + 1].x - (segs[i].x + segs[i].w) >= spaceGap) {
+      segs = segs.slice(0, i + 1);
+      break;
+    }
+  }
+
+  /* Sort each segment into a glyph or a punctuation mark by height. A comma or
+   * a decimal point is a fraction of a digit tall and sits on the baseline, so
+   * neither is worth classifying against a bank that holds no template for it —
+   * their meaning comes from how many digits follow instead. */
+  const tokens = [];
+  const digits = [];
+  for (const seg of segs) {
+    const bb = tightBBox(bin, W, seg.x, row.y, seg.w, row.h);
+    if (!bb || bb.w < 2 || bb.h < 2) continue;
+
+    if (bb.h < tallMin) {
+      if (bb.y + bb.h >= row.y + row.h * CFG.RATIO_SEP_BASELINE) {
+        tokens.push({ t: 'sep' });
+        digits.push({
+          segBounds: seg, tightBounds: bb, glyphCanvas: null,
+          classification: null, status: 'accepted', rejectReason: 'separator',
+        });
+      }
+      continue;                         /* anything else this short is noise */
+    }
+    if (bb.h < minDH) continue;
+
+    const glyph = normalizeGlyph(gray, bb.x, bb.y, bb.w, bb.h);
+    glyph.features = computeStructuralFeatures(glyph.binary, CFG.NORM_W, CFG.NORM_H, glyph.grayscale);
+    const cls = classifyGlyph(glyph, bank);
+    let ambiguity = isAmbiguous(cls);
+    if (ambiguity && witnesses && witnesses.length && confirmedByColumn(glyph, cls, witnesses)) {
+      ambiguity = false;
+    }
+
+    tokens.push({ t: 'glyph', ch: String(cls.digit), score: cls.score, ambiguity, idx: digits.length });
+    digits.push({
+      segBounds: seg, tightBounds: bb, glyphCanvas: glyph.canvas, classification: cls,
+      status: ambiguity ? 'ambiguous' : 'accepted', rejectReason: ambiguity,
+      glyph,
+    });
+  }
+
+  const glyphs = tokens.filter(t => t.t === 'glyph');
+  if (!glyphs.length) return { state: 'empty', digits };
+
+  /* Read the run both ways — as a bare number, and with the first glyph taken
+   * as a currency mark — and let `lead` or the punctuation decide between them. */
+  const withMark = parseNumberTokens(tokens.slice(tokens.indexOf(glyphs[0]) + 1));
+  const asIs = parseNumberTokens(tokens);
+
+  let currency;
+  if (lead === 'currency')   currency = true;
+  else if (lead === 'digit') currency = false;
+  else if (glyphs[0].ch === '$') currency = true;
+  else {
+    /* The bank holds no template for a red '$', which comes back as a digit and
+     * pushes the number to a four-digit leading group — "$315,000" read as
+     * "3315000". No grouped number is written that way, so the overlong group
+     * is itself the evidence that the glyph was a currency mark. */
+    currency = asIs.state === 'bad-leading-group' && withMark.state === 'value';
+  }
+
+  const parsed = currency ? withMark : asIs;
+  if (parsed.state !== 'value') return { state: parsed.state, hasDollar: currency, digits };
+
+  return {
+    state: 'value',
+    hasDollar: currency,
+    value: parsed.value,
+    digitCount: parsed.digitCount,
+    text: (currency ? '$' : '') + parsed.text,
+    digits,
+    /* Only the glyphs the reading actually used — a currency mark misread as a
+     * digit is not among them, so it never reaches the bank. */
+    read: parsed.used.map(t => digits[t.idx]),
+  };
+}
+
+/**
+ * Read a token run as one US-formatted number.
+ *
+ * Grouping is judged before confidence is, so a cell whose punctuation already
+ * rules the reading out — a leading group of four, say — reports that rather
+ * than whatever the classifier made of its first glyph.
+ */
+function parseNumberTokens(tokens) {
+  const body = tokens.slice();
+  while (body.length && body[0].t === 'sep') body.shift();
+  while (body.length && body[body.length - 1].t === 'sep') body.pop();
+  if (!body.length) return { state: 'empty-body' };
+
+  /* Group the digits around the separators, then read the groups as ordinary
+   * US number punctuation: a separator with three digits behind it is a
+   * thousands mark, and a trailing group of one or two is the cents on a
+   * concession like 1322.45. */
+  const groups = [[]];
+  for (const t of body) {
+    if (t.t === 'sep') { groups.push([]); continue; }
+    if (!/^[0-9]$/.test(t.ch)) return { state: `non-digit-${t.ch}` };
+    groups[groups.length - 1].push(t);
+  }
+  if (groups.some(g => !g.length)) return { state: 'empty-group' };
+
+  const last = groups[groups.length - 1];
+  const frac = (groups.length > 1 && last.length <= 2) ? last.map(t => t.ch).join('') : '';
+  const intGroups = frac ? groups.slice(0, -1) : groups;
+  if (!intGroups.length) return { state: 'empty-body' };
+
+  if (intGroups.length > 1) {
+    if (intGroups[0].length > 3) return { state: 'bad-leading-group' };
+    for (let i = 1; i < intGroups.length; i++) {
+      if (intGroups[i].length !== 3) return { state: `bad-thousands-group-${i}` };
+    }
+  }
+
+  const intStr = intGroups.map(g => g.map(t => t.ch).join('')).join('');
+  if (intStr.length > 9) return { state: 'bad-length' };
+
+  const used = groups.flat();
+  if (used.some(t => t.ambiguity)) return { state: 'ambiguous-glyph' };
+  if (Math.min(...used.map(t => t.score)) < CFG.MIN_DIGIT_SCORE) return { state: 'low-confidence' };
+
+  return {
+    state: 'value',
+    value: parseInt(intStr, 10) + (frac ? parseInt(frac, 10) / Math.pow(10, frac.length) : 0),
+    digitCount: intStr.length,
+    text: intStr + (frac ? `.${frac}` : ''),
+    used,
+  };
+}
+
+/**
+ * Label every column band 'price', 'plain' or 'other'.
+ *
+ * The whole cell is read rather than just its first glyph, because the first
+ * glyph is exactly what a red '$' gets wrong. A band whose cells read as money
+ * is 'price'; one whose cells read as bare numbers, with no money anywhere, is
+ * 'plain'; text columns parse as neither and fall through to 'other'. A price
+ * needs four integer digits, which keeps a four-letter status code like "CLSD"
+ * — whose 'C' does match the bank's '$' — out of the money columns.
+ */
+function typeColumnBands(bands, surf, bank, medH) {
+  const typed = [];
+
+  for (const band of bands) {
+    let filled = 0, price = 0, plain = 0;
+
+    for (const row of surf.rows) {
+      /* A band that has filled this many rows without a single one reading as a
+       * number is a text column — a street name or a city, the widest cells on
+       * the page — and classifying the rest of it buys nothing. */
+      if (filled >= CFG.RATIO_TYPE_BAILOUT_ROWS && !price && !plain) break;
+
+      const cell = readCell(band, row, surf, bank, medH);
+      if (cell.state === 'empty') continue;
+      filled++;
+      if (cell.state !== 'value') continue;
+      if (cell.hasDollar) {
+        if (cell.digitCount >= CFG.RATIO_MIN_PRICE_DIGITS) price++;
+      } else {
+        plain++;
+      }
+    }
+
+    /* A band holding nothing but its header is 'sparse' rather than unknown:
+     * CONC is blank far more often than not, and a run of sales with no
+     * concessions at all should still yield ratios. */
+    let kind = filled < CFG.RATIO_MIN_FILLED_ROWS ? 'sparse' : 'other';
+    if (kind === 'other') {
+      if (price / filled >= CFG.RATIO_MIN_PRICE_FRAC) kind = 'price';
+      else if (!price && plain / filled >= CFG.RATIO_MIN_PLAIN_FRAC) kind = 'plain';
+    }
+    typed.push({ band, kind, filled, price, plain });
+  }
+
+  return typed;
+}
+
+/**
+ * Locate Sold Pr, CONC and Orig List Pr in an upscaled page.
+ * Returns the three bands plus the cleaned bitmap they were found on, or null
+ * when the crop does not hold the price -> plain -> price signature.
+ */
+function findRatioColumns(surf, bank) {
+  const { bin, W, H, rows } = surf;
+  if (rows.length < CFG.RATIO_MIN_FILLED_ROWS) return null;
+
+  const medH = medianRowHeight(rows);
+  const clean = suppressGridLines(bin, W, H, medH);
+  const bands = findColumnBands(clean, W, rows, medH);
+  if (bands.length < 3) {
+    console.log(`[Ratio] ${bands.length} band(s) — a sale/list ratio needs Sold Pr, CONC and Orig List Pr`);
+    return null;
+  }
+
+  const typed = typeColumnBands(bands, { ...surf, bin: clean }, bank, medH);
+  for (const t of typed) {
+    console.log(`[Ratio] band x=${t.band.x} w=${t.band.w}: ${t.kind} (filled=${t.filled} price=${t.price} plain=${t.plain})`);
+  }
+
+  for (let i = 0; i + 2 < typed.length; i++) {
+    const middle = typed[i + 1].kind;
+    if (typed[i].kind === 'price' && (middle === 'plain' || middle === 'sparse') && typed[i + 2].kind === 'price') {
+      console.log(`[Ratio] Sold Pr x=${typed[i].band.x}, CONC x=${typed[i + 1].band.x}, Orig List Pr x=${typed[i + 2].band.x}`);
+      return { sold: typed[i].band, conc: typed[i + 1].band, orig: typed[i + 2].band, medH, clean };
+    }
+  }
+
+  console.log('[Ratio] No price -> plain -> price triple — sale/list ratios unavailable');
+  return null;
+}
+
+/**
+ * Read every row that carries both a sold price and an original list price.
+ *
+ * Concessions come off the sale price before the division. A row with no
+ * concession — the usual case — divides the sale price as it stands, and a row
+ * missing either price is skipped rather than guessed at, so an active listing
+ * with no sale yet contributes nothing.
+ */
+function readRatioRows(cols, surf, bank) {
+  const read = { ...surf, bin: cols.clean };
+  const pass1 = readRatioPass(cols, read, bank, null);
+  const first = pass1.ratios.filter(Boolean).length;
+
+  /* Orig List Pr and List Price are printed in red, which costs their glyphs
+   * enough contrast that a trailing zero here and there lands inside the 0/9
+   * confusable margin and takes its whole row down with it.
+   *
+   * Folding those glyphs into the template bank is the wrong lever — a new
+   * template lifts the runner-up as readily as the winner, and a bank tuned on
+   * this column starts rejecting the black one. What the column does offer is
+   * its own repetition: the same digit is drawn identically in every row, so a
+   * borderline glyph can be checked against the instances that already read
+   * cleanly in that same column. Pass 2 only ever confirms what the classifier
+   * already ranked first, so no reading is overridden by the comparison. */
+  const witnesses = pass1.witnesses;
+  const total = Object.values(witnesses).reduce((n, w) => n + w.length, 0);
+  console.log(`[Ratio] Pass 1 read ${first} row(s); ${total} confident glyph(s) to compare against`);
+  if (!total) return finishRatioPass(pass1);
+
+  const pass2 = readRatioPass(cols, read, bank, witnesses);
+
+  /* Pass 1 is never overridden — pass 2 only fills rows it could not read. */
+  let recovered = 0;
+  for (let i = 0; i < pass1.ratios.length; i++) {
+    if (pass1.ratios[i] || !pass2.ratios[i]) continue;
+    pass1.ratios[i] = pass2.ratios[i];
+    pass1.rowResults[i] = pass2.rowResults[i];
+    recovered++;
+    console.log(`[Ratio] Pass 2 recovered y=${surf.rows[i].y}: ${pass2.rowResults[i].result}`);
+  }
+  console.log(`[Ratio] Pass 2 recovered ${recovered} row(s)`);
+  return finishRatioPass(pass1);
+}
+
+/** Drop the empty slots a pass leaves behind and hand back a flat result. */
+function finishRatioPass(pass) {
+  return { ratios: pass.ratios.filter(Boolean), rowResults: pass.rowResults };
+}
+
+/**
+ * Decide whether a column's own confident glyphs back up an ambiguous reading.
+ *
+ * The comparison is deliberately one-directional: it can only agree with the
+ * digit the classifier already ranked first, never substitute another. A glyph
+ * clears when it matches that digit's instances closely and matches every other
+ * digit's instances measurably less well.
+ */
+function confirmedByColumn(glyph, cls, witnesses) {
+  const top = String(cls.digit);
+  let mine = -1, other = -1;
+
+  for (const w of witnesses) {
+    const score = ncc(glyph.grayscale, w.grayscale);
+    if (w.digit === top) { if (score > mine) mine = score; }
+    else if (score > other) other = score;
+  }
+
+  return mine >= CFG.RATIO_WITNESS_NCC && mine - other >= CFG.RATIO_WITNESS_MARGIN;
+}
+
+/**
+ * One reading of the three columns across every row. `ratios` is aligned to
+ * `surf.rows`, holding null where the row yielded nothing, so a later pass can
+ * be merged in by index. `witnesses`, when given, lets an ambiguous glyph be
+ * cleared by the rest of its column.
+ */
+function readRatioPass(cols, surf, bank, witnesses) {
+  const read = surf;   /* cells are read off the cleaned bitmap the caller passed */
+  const ratios = [];
+  const rowResults = [];
+  const found = { sold: [], conc: [], orig: [] };
+
+  for (const row of surf.rows) {
+    /* The columns are typed by now, so each cell is read the one way its column
+     * allows rather than being re-guessed row by row. */
+    const sold = readCell(cols.sold, row, read, bank, cols.medH, 'currency', witnesses?.sold);
+    const orig = readCell(cols.orig, row, read, bank, cols.medH, 'currency', witnesses?.orig);
+    const conc = readCell(cols.conc, row, read, bank, cols.medH, 'digit', witnesses?.conc);
+    const rr = {
+      row, segments: [], segMethod: 'ratio-columns',
+      digits: [...sold.digits, ...conc.digits, ...orig.digits],
+      result: null, status: null,
+    };
+
+    /* Any cell that read cleanly can vouch for its column later, including one
+     * on a row the ratio itself never reaches. */
+    for (const [name, cell] of [['sold', sold], ['conc', conc], ['orig', orig]]) {
+      if (cell.state !== 'value' || !cell.read) continue;
+      for (const dd of cell.read) {
+        if (dd.status !== 'accepted' || dd.classification.score < CFG.RATIO_WITNESS_SCORE) continue;
+        found[name].push({ digit: String(dd.classification.digit), grayscale: dd.glyph.grayscale });
+      }
+    }
+
+    const skip = (status) => { rr.status = status; rowResults.push(rr); ratios.push(null); };
+
+    if (sold.state !== 'value' || sold.digitCount < CFG.RATIO_MIN_PRICE_DIGITS) {
+      skip(`rejected-sold-price:${sold.state}`);
+      continue;
+    }
+    if (orig.state !== 'value' || orig.digitCount < CFG.RATIO_MIN_PRICE_DIGITS || !(orig.value > 0)) {
+      skip(`rejected-orig-list-price:${orig.state}`);
+      continue;
+    }
+
+    /* A concession cell that failed to parse is not the same as an empty one,
+     * and quietly reading it as zero would overstate the ratio. */
+    if (conc.state !== 'empty' && (conc.state !== 'value' || conc.hasDollar)) {
+      skip(`rejected-concession:${conc.state}`);
+      continue;
+    }
+    const concession = conc.state === 'value' ? conc.value : 0;
+
+    const ratio = (sold.value - concession) / orig.value * 100;
+    if (!isFinite(ratio) || ratio <= 0 || ratio > CFG.RATIO_MAX_PCT) {
+      skip(`rejected-implausible:${ratio.toFixed(1)}`);
+      continue;
+    }
+
+    rr.result = `${sold.text} - ${concession} / ${orig.text} = ${formatRatio(ratio)}`;
+    rr.status = 'accepted';
+    rowResults.push(rr);
+    ratios.push({ ratio, sold: sold.value, concession, orig: orig.value, y: row.y });
+    console.log(`[Ratio] y=${row.y}: ${rr.result}`);
+  }
+
+  return { ratios, rowResults, witnesses: found };
+}
+
+/** Format a percentage the way the grid reports it. */
+function formatRatio(pct) {
+  return `${pct.toFixed(CFG.RATIO_DECIMALS)}%`;
+}
+
+/* ================================================================== */
 /*  SECTION 11 — MAIN PIPELINE                                        */
 /* ================================================================== */
 
@@ -2429,6 +2846,99 @@ function recognizePriceRows(rows, bin, grayCanvas, bank, tag) {
   return { accepted, rowResults, allGlyphs };
 }
 
+/**
+ * Two-pass MLS # recognition over an already-isolated column.
+ *
+ * Pass 1 reads the rows against the reference bank; its high-confidence glyphs
+ * are folded into a clone of the bank and the same rows are read again. The
+ * merge is deliberately one-sided — pass 1 results are never overridden, and
+ * pass 2 only recovers rows pass 1 rejected, and only when every digit clears
+ * the confusable margin.
+ *
+ * `pct` carries the caller's progress budget, since the ratio pipeline reaches
+ * this stage having already spent part of the bar.
+ */
+async function recognizeMlsTwoPass(rows, bin, grayCanvas, bank, perf, pct) {
+  /* --- Pass 1: reference templates --- */
+  Perf.start('classification_p1');
+  showStatus('Recognizing digits (pass 1)…', 'info');
+  await new Promise(r => setTimeout(r, 0));
+
+  const p1 = recognizeRows(rows, bin, grayCanvas, bank, 'P1');
+  console.log(`[P1] Accepted ${p1.accepted.length}: ${p1.accepted.join(', ')}`);
+  perf.classification_p1 = Perf.end('classification_p1');
+  updateProgress(pct.p1);
+
+  /* --- Enhance bank with high-confidence P1 glyphs --- */
+  Perf.start('bank_refinement');
+  const enhanced = cloneBank(bank);
+  let added = 0;
+  for (const g of p1.allGlyphs) {
+    if (g.score >= CFG.REFINE_SCORE && g.margin >= CFG.REFINE_MARGIN) {
+      if (accumulateTemplate(enhanced, g.digit, g.grayscale, g.binary, g.features, g.score)) {
+        added++;
+      }
+    }
+  }
+  console.log(`[Refine] Added ${added} high-confidence glyphs to enhanced bank`);
+  perf.bank_refinement = Perf.end('bank_refinement');
+
+  /* --- Pass 2: enhanced bank --- */
+  Perf.start('classification_p2');
+  showStatus('Recognizing digits (pass 2)…', 'info');
+  await new Promise(r => setTimeout(r, 0));
+
+  const p2 = recognizeRows(rows, bin, grayCanvas, enhanced, 'P2');
+  console.log(`[P2] Accepted ${p2.accepted.length}: ${p2.accepted.join(', ')}`);
+  perf.classification_p2 = Perf.end('classification_p2');
+  updateProgress(pct.p2);
+
+  /* --- Conservative P1/P2 merge --- */
+  const p1Set = new Set(p1.accepted);
+  const results = [...p1.accepted];
+  const rowResults = p1.rowResults.map(rr => ({ ...rr }));
+  let p2Additions = 0;
+
+  for (let i = 0; i < p2.rowResults.length; i++) {
+    const p2rr = p2.rowResults[i];
+    const p1rr = p1.rowResults[i];
+    const p1Acc = p1rr.status === 'accepted' || p1rr.status === 'accepted-pass2';
+    const p2Acc = p2rr.status === 'accepted' || p2rr.status === 'accepted-pass2';
+
+    if (!p1Acc && p2Acc && p2rr.result && /^\d{8}$/.test(p2rr.result)) {
+      const allConfident = p2rr.digits.every(dd =>
+        dd.classification && dd.classification.margin >= CFG.CONFUSABLE_MARGIN
+      );
+      if (allConfident && !p1Set.has(p2rr.result)) {
+        results.push(p2rr.result);
+        p1Set.add(p2rr.result);
+        rowResults[i] = { ...p2rr, status: 'accepted-pass2' };
+        p2Additions++;
+        console.log(`[Merge] P2 recovered row ${i}: ${p2rr.result}`);
+      }
+    }
+  }
+
+  console.log(`[Result] P1: ${p1.accepted.length}, P2 additions: ${p2Additions}, total: ${results.length}`);
+  return { results, rowResults, glyphs: p1.allGlyphs };
+}
+
+/**
+ * Crop to the MLS # column and read it, for a page that also holds other data.
+ * Returns null when no band carries the MLS # signature.
+ */
+async function extractMlsColumn(surf, bank, perf, pct) {
+  const column = isolateMlsColumn(surf, bank);
+  if (!column) return null;
+
+  showStatus('Isolating MLS # column…', 'info');
+  const cropped = cropCanvas(surf.gray, column.x, 0, column.w, surf.gray.height);
+  const crop = analyzeSurface(cropped);
+  console.log(`[Column] Re-analyzed crop ${crop.W}×${crop.H}: Otsu ${crop.thr}, ${crop.rows.length} rows`);
+
+  return recognizeMlsTwoPass(crop.rows, crop.bin, crop.gray, bank, perf, pct);
+}
+
 /** Calculate the median of an array of numbers. */
 function calculateMedian(arr) {
   if (arr.length === 0) return 0;
@@ -2446,15 +2956,15 @@ function formatPrice(val) {
 }
 
 /** Update count badge label and count number dynamically. */
-function updateCountBadge(count, isPrice) {
+function updateCountBadge(count, noun) {
   const numEl = document.getElementById('count-number');
   if (numEl) numEl.textContent = count;
-  
+
   const textNode = Array.from(countBadge.childNodes).find(n => n.nodeType === Node.TEXT_NODE && n.textContent.includes('found'));
   if (textNode) {
-    textNode.textContent = isPrice ? ' prices found' : ' MLS numbers found';
+    textNode.textContent = ` ${noun} found`;
   } else {
-    countBadge.innerHTML = `<span>🔢</span> <span id="count-number">${count}</span> ${isPrice ? 'prices' : 'MLS numbers'} found`;
+    countBadge.innerHTML = `<span>🔢</span> <span id="count-number">${count}</span> ${noun} found`;
   }
 }
 
@@ -2535,12 +3045,67 @@ async function runExtraction() {
     let rows = rawRows.filter(r => r.h >= minH && r.h <= maxH);
     console.log(`[Seg] ${rows.length} rows after height filter [${minH}–${maxH}px]`);
 
+    let W = up.width, H = up.height;
+    const surfInitial = { gray: grayCanvas, bin, W, H, rows, rawRows, thr, minH, maxH };
+
+    /* --- Sale-to-list ratios ---
+     * Read before anything crops the page, since the ratio spans three columns
+     * that no single-column crop can hold. When the triple is there it decides
+     * the run: the ratios lead the output, and the MLS # column — if the crop
+     * reaches that far — is read alongside them for the clipboard. */
+    Perf.start('ratio');
+    showStatus('Looking for sale/list ratio columns…', 'info');
+    const ratioCols = findRatioColumns(surfInitial, bank);
+    const ratioRead = ratioCols ? readRatioRows(ratioCols, surfInitial, bank) : null;
+    perf.ratio = Perf.end('ratio');
+
+    if (ratioRead && ratioRead.ratios.length) {
+      perf.segmentation = Perf.end('segmentation');
+      updateProgress(40);
+      console.log(`[Ratio] ${ratioRead.ratios.length} sale/list ratio(s)`);
+
+      /* The MLS # column is optional here — a three-column grab has none. */
+      const mls = await extractMlsColumn(surfInitial, bank, perf, { p1: 70, p2: 90 });
+
+      perf.total = Perf.end('total');
+      updateProgress(100);
+      console.log(`==========================================\n`);
+
+      const ratioList = ratioRead.ratios.map(r => formatRatio(r.ratio)).join(', ');
+      const numbers = mls ? mls.results : [];
+
+      outputBox.value = numbers.length
+        ? `Sale/List Ratios: ${ratioList}\nMLS Numbers: ${numbers.join(', ')}`
+        : `Sale/List Ratios: ${ratioList}`;
+
+      /* MLS numbers are what gets pasted back into the grid, so they win the
+       * clipboard whenever the crop carried both. */
+      valueToCopy = numbers.length ? numbers.join(', ') : ratioList;
+
+      resultCard.classList.remove('hidden');
+      updateCountBadge(ratioRead.ratios.length, 'sale/list ratios');
+      countBadge.classList.remove('hidden');
+      copyBtn.disabled = false;
+      progressWrap.classList.add('hidden');
+      await copyToClipboard(valueToCopy);
+      showStatus(numbers.length
+        ? `Extraction complete — ${ratioRead.ratios.length} ratios read, ${numbers.length} MLS numbers copied to clipboard.`
+        : `Extraction complete — ${ratioRead.ratios.length} ratios copied to clipboard.`, 'success');
+
+      if (debugCard) {
+        Perf.start('debug_render');
+        renderDebugOverlay(grayCanvas, ratioRead.rowResults);
+        renderDebugTable(ratioRead.rowResults, perf);
+        debugCard.classList.remove('hidden');
+        perf.debug_render = Perf.end('debug_render');
+      }
+      return;
+    }
+
     /* --- Full-page column isolation ---
      * A multi-column scan is cropped down to the MLS # column, then re-analyzed
      * so binarization and row bands are computed on the isolated column alone. */
     Perf.start('column_isolation');
-    let W = up.width, H = up.height;
-    const surfInitial = { gray: grayCanvas, bin, W, H, rows, rawRows, thr, minH, maxH };
     const column = isolateMlsColumn(surfInitial, bank);
     if (column) {
       showStatus('Isolating MLS # column…', 'info');
@@ -2658,7 +3223,7 @@ async function runExtraction() {
       valueToCopy = formattedMedian;
 
       resultCard.classList.remove('hidden');
-      updateCountBadge(results.length, true);
+      updateCountBadge(results.length, 'prices');
       countBadge.classList.remove('hidden');
       copyBtn.disabled = false;
       progressWrap.classList.add('hidden');
@@ -2676,75 +3241,12 @@ async function runExtraction() {
 
     } else {
       /* --- Original MLS# Pipeline --- */
-      /* --- Pass 1: reference templates --- */
-      Perf.start('classification_p1');
-      showStatus('Recognizing digits (pass 1)…', 'info');
-      await new Promise(r => setTimeout(r, 0));
-
-      const p1 = recognizeRows(rows, bin, grayCanvas, bank, 'P1');
-      console.log(`[P1] Accepted ${p1.accepted.length}: ${p1.accepted.join(', ')}`);
-      perf.classification_p1 = Perf.end('classification_p1');
-      updateProgress(50);
-
-      /* --- Enhance bank with high-confidence P1 glyphs --- */
-      Perf.start('bank_refinement');
-      const enhanced = cloneBank(bank);
-      let added = 0;
-      for (const g of p1.allGlyphs) {
-        if (g.score >= CFG.REFINE_SCORE && g.margin >= CFG.REFINE_MARGIN) {
-          if (accumulateTemplate(enhanced, g.digit, g.grayscale, g.binary, g.features, g.score)) {
-            added++;
-          }
-        }
-      }
-      console.log(`[Refine] Added ${added} high-confidence glyphs to enhanced bank`);
-      perf.bank_refinement = Perf.end('bank_refinement');
-
-      /* --- Pass 2: enhanced bank --- */
-      Perf.start('classification_p2');
-      showStatus('Recognizing digits (pass 2)…', 'info');
-      await new Promise(r => setTimeout(r, 0));
-
-      const p2 = recognizeRows(rows, bin, grayCanvas, enhanced, 'P2');
-      console.log(`[P2] Accepted ${p2.accepted.length}: ${p2.accepted.join(', ')}`);
-      perf.classification_p2 = Perf.end('classification_p2');
-      updateProgress(85);
-
-      /* --- Conservative P1/P2 merge ---
-       * P1 accepted results are NEVER overridden.
-       * P2 may ADD numbers from rows that P1 rejected, but only if P2
-       * accepted them with all digits having margin ≥ CONFUSABLE_MARGIN. */
-      const p1Set = new Set(p1.accepted);
-      const mergedResults = [...p1.accepted];
-      const mergedRowResults = p1.rowResults.map(rr => ({ ...rr }));
-      let p2Additions = 0;
-
-      for (let i = 0; i < p2.rowResults.length; i++) {
-        const p2rr = p2.rowResults[i];
-        const p1rr = p1.rowResults[i];
-        const p1Acc = p1rr.status === 'accepted' || p1rr.status === 'accepted-pass2';
-        const p2Acc = p2rr.status === 'accepted' || p2rr.status === 'accepted-pass2';
-
-        if (!p1Acc && p2Acc && p2rr.result && /^\d{8}$/.test(p2rr.result)) {
-          const allConfident = p2rr.digits.every(dd =>
-            dd.classification && dd.classification.margin >= CFG.CONFUSABLE_MARGIN
-          );
-          if (allConfident && !p1Set.has(p2rr.result)) {
-            mergedResults.push(p2rr.result);
-            p1Set.add(p2rr.result);
-            mergedRowResults[i] = { ...p2rr, status: 'accepted-pass2' };
-            p2Additions++;
-            console.log(`[Merge] P2 recovered row ${i}: ${p2rr.result}`);
-          }
-        }
-      }
-
-      const results = mergedResults;
-      const finalRowResults = mergedRowResults;
-      console.log(`[Result] P1: ${p1.accepted.length}, P2 additions: ${p2Additions}, total: ${results.length}`);
+      const mls = await recognizeMlsTwoPass(rows, bin, grayCanvas, bank, perf, { p1: 50, p2: 85 });
+      const results = mls.results;
+      const finalRowResults = mls.rowResults;
 
       /* --- Accumulate to persistent bank (for next extraction) --- */
-      const glyphsForBank = p1.allGlyphs;
+      const glyphsForBank = mls.glyphs;
       let persisted = 0;
       for (const g of glyphsForBank) {
         if (g.score >= CFG.REFINE_SCORE && g.margin >= CFG.REFINE_MARGIN) {
@@ -2783,7 +3285,7 @@ async function runExtraction() {
       valueToCopy = outputBox.value;
 
       resultCard.classList.remove('hidden');
-      updateCountBadge(results.length, false);
+      updateCountBadge(results.length, 'MLS numbers');
       countBadge.classList.remove('hidden');
       copyBtn.disabled = false;
       progressWrap.classList.add('hidden');
